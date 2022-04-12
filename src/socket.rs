@@ -1,12 +1,12 @@
 use std::collections::HashMap;
 use std::io;
-use std::task::{Context, Poll, Waker};
-use std::time::{Duration, Instant};
+use std::task::{Context, Poll};
+
 use std::{collections::VecDeque, net::SocketAddr, sync::Arc};
 use tokio::io::ReadBuf;
 use tokio::net::UdpSocket;
 
-use crate::packet::{Header, Packet, PacketStatus, PendingRead};
+use crate::packet::{Header, Packet, PacketStatus};
 use crate::{constants::*, AckRes, UdxStream};
 use crate::{StreamRef, UdxBuf};
 
@@ -116,9 +116,9 @@ impl UdxSocket {
         let incoming = match self.socket.poll_recv_from(cx, &mut buf) {
             Poll::Pending => None,
             Poll::Ready(Ok(peer)) => Some((buf.filled().len(), peer)),
-            Poll::Ready(Err(err)) => None,
+            Poll::Ready(Err(_err)) => None,
         };
-        if let Some((n, peer)) = incoming {
+        if let Some((n, _peer)) = incoming {
             match self.process_incoming(n) {
                 Ok(ProcessRes::Handled) => {}
                 Ok(ProcessRes::NotHandled) => {
@@ -353,7 +353,7 @@ impl UdxSocket {
     /*     true */
     /* } */
 
-    fn on_unhandled_packet(&self, buf: &[u8]) -> io::Result<()> {
+    fn on_unhandled_packet(&self, _buf: &[u8]) -> io::Result<()> {
         // TODO: What to do with non-stream packets?
         Ok(())
     }
@@ -362,7 +362,7 @@ impl UdxSocket {
         self.send_queue.push_back(packet)
     }
 
-    pub fn send(&self, req: SendRequest) {}
+    pub fn send(&self, _req: SendRequest) {}
     pub fn send_ttl(&mut self, mut req: SendRequest, buf: UdxBuf, dest: SocketAddr, ttl: u32) {
         {
             let pkt = &mut req.pkt;

@@ -13,7 +13,7 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use crate::packet::{
     Header, OnAckCallback, Packet, PacketContext, PacketStatus, PendingRead, PktStreamWrite,
 };
-use crate::UdxBuf;
+
 use crate::{constants::*, UdxSocket};
 
 pub type Time = u64;
@@ -277,7 +277,7 @@ impl UdxStream {
         }
     }
 
-    pub fn on_recv(&mut self, buf: Vec<u8>) {
+    pub fn on_recv(&mut self, _buf: Vec<u8>) {
         unimplemented!()
     }
 
@@ -386,7 +386,7 @@ impl UdxStream {
             .queue_send(packet)
     }
 
-    pub fn close_maybe(&mut self, err: Option<ErrorKind>) -> bool {
+    pub fn close_maybe(&mut self, _err: Option<ErrorKind>) -> bool {
         // unimplemented!()
         true
     }
@@ -467,7 +467,7 @@ impl UdxStream {
         AckRes::Acked
     }
 
-    pub fn write(&mut self, mut req: PktStreamWrite, buf: &[u8]) -> io::Result<usize> {
+    pub fn write(&mut self, req: PktStreamWrite, buf: &[u8]) -> io::Result<usize> {
         if self.inflight == 0 {
             self.rto_timeout = get_milliseconds() + (self.rto as u64);
         }
@@ -560,13 +560,13 @@ impl UdxStream {
     }
 
     fn flush_waiting_packets(&mut self) {
-        let was_waiting = self.pkts_waiting;
-        let mut seq = if self.retransmits_waiting > 0 {
+        let _was_waiting = self.pkts_waiting;
+        let seq = if self.retransmits_waiting > 0 {
             self.remote_acked
         } else {
             self.seq - self.pkts_waiting
         };
-        let mut sent = 0;
+        let _sent = 0;
         while seq != self.seq && self.pkts_waiting > 0 {
             if let Some(packet) = self.outgoing.remove(&seq) {
                 if !matches!(packet.status, PacketStatus::Waiting) {

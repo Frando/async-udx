@@ -1,7 +1,6 @@
 use std::{
     net::SocketAddr,
     sync::{atomic::AtomicU32, Arc},
-    time::Instant,
 };
 
 use crate::{constants::*, StreamRef, UdxBuf, UdxSocket, UdxStream};
@@ -162,7 +161,7 @@ impl Header {
 }
 
 impl Packet {
-    pub fn read(buf: &[u8]) -> Option<Self> {
+    pub fn read(_buf: &[u8]) -> Option<Self> {
         None
     }
 }
