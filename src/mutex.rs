@@ -26,15 +26,23 @@ impl<T> Mutex<T> {
     /// Acquires the lock for a certain purpose
     ///
     /// The purpose will be recorded in the list of last lock owners
-    pub fn lock(&self, _purpose: &'static str) -> MutexGuard<T> {
-        MutexGuard {
-            guard: self.inner.lock().unwrap(),
-        }
+    pub fn lock(&self, purpose: &'static str) -> MutexGuard<T> {
+        // eprintln!("TAKE: {}", purpose);
+        let guard = self.inner.lock().unwrap();
+        // eprintln!("HOLD: {}", purpose);
+        MutexGuard { guard, purpose }
     }
 }
 
 pub struct MutexGuard<'a, T> {
     guard: std::sync::MutexGuard<'a, T>,
+    purpose: &'static str,
+}
+
+impl<'a, T> Drop for MutexGuard<'a, T> {
+    fn drop(&mut self) {
+        // eprintln!("DROP: {}", self.purpose);
+    }
 }
 
 impl<'a, T> Deref for MutexGuard<'a, T> {
