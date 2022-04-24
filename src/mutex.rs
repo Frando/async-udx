@@ -54,10 +54,9 @@ mod tracking {
             let lock_time = Instant::now();
             let elapsed = lock_time.duration_since(now);
 
-            if elapsed > Duration::from_millis(1) {
-                // if elapsed > Duration::from_micros(100) {
+            if elapsed > Duration::from_millis(2) {
                 warn!(
-                    "Locking the connection for {} took {:?}. Last owners: {:?}",
+                    "Locking for {} took {:?}. Last owners: {:?}",
                     purpose, elapsed, guard.last_lock_owner
                 );
             }
@@ -84,9 +83,9 @@ mod tracking {
 
             let duration = self.start_time.elapsed();
 
-            if duration > Duration::from_millis(1) {
+            if duration > Duration::from_millis(2) {
                 warn!(
-                    "Utilizing the connection for {} took {:?}",
+                    "Utilizing the lock for {} took {:?}",
                     self.purpose, duration
                 );
             }

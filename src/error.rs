@@ -31,6 +31,12 @@ impl From<io::Error> for UdxError {
     }
 }
 
+impl From<&io::Error> for UdxError {
+    fn from(err: &io::Error) -> Self {
+        Self::new(err.kind(), format!("{}", err))
+    }
+}
+
 impl From<UdxError> for io::Error {
     fn from(err: UdxError) -> Self {
         io::Error::new(err.kind, err.reason)

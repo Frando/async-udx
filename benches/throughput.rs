@@ -25,9 +25,9 @@ fn bench_throughput(c: &mut Criterion) {
     let mut group = c.benchmark_group("throughput");
     // let len: usize = 1024 * 1024 * 1; // 1M
     // let len: usize = 1024 * 3;
-    let lens = [1024 * 4, 1024 * 64, 1024 * 512, 1024 * 1024];
+    // let lens = [1024 * 4, 1024 * 64, 1024 * 512, 1024 * 1024];
     // let lens = [1024 * 512, 1024 * 1024];
-    // let lens = [1024 * 4, 1024 * 64];
+    let lens = [1024 * 4, 1024 * 512];
     // let lens = [1024 * 64];
     // let lens = [1024 * 512];
     for len in lens {

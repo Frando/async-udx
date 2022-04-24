@@ -15,10 +15,10 @@ use tracing::{debug, trace};
 
 use crate::constants::UDX_HEADER_SIZE;
 use crate::mutex::Mutex;
-use crate::packet::{Header, IncomingPacket, Packet};
+use crate::packet::{Header, IncomingPacket, Packet, PacketRef};
 use crate::stream::UdxStream;
 
-const MAX_LOOP: usize = 50;
+const MAX_LOOP: usize = 60;
 
 #[derive(Debug)]
 pub(crate) enum EventIncoming {
@@ -43,20 +43,14 @@ impl std::ops::Deref for UdxSocket {
 impl UdxSocket {
     pub async fn bind<A: ToSocketAddrs>(addr: A) -> io::Result<Self> {
         let inner = UdxSocketInner::bind(addr).await?;
-        let socket = Arc::new(Mutex::new(inner));
-        let this = Self(socket);
-        tokio::task::spawn({
-            let socket = this.clone();
-            async move {
-                loop {
-                    let res = socket.next().await;
-                    if let Err(_) = res {
-                        break;
-                    }
-                }
+        let socket = Self(Arc::new(Mutex::new(inner)));
+        let driver = SocketDriver(socket.clone());
+        tokio::spawn(async {
+            if let Err(e) = driver.await {
+                tracing::error!("Socket I/O error: {}", e);
             }
         });
-        Ok(this)
+        Ok(socket)
     }
 
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
@@ -73,34 +67,29 @@ impl UdxSocket {
             .lock("UdxSocket::connect")
             .connect(dest, local_id, remote_id)
     }
-
-    pub(crate) fn next(&self) -> SocketDriver {
-        SocketDriver {
-            socket: self.clone(),
-        }
-    }
 }
 
-pub struct SocketDriver {
-    socket: UdxSocket,
-}
+pub struct SocketDriver(UdxSocket);
 
 impl Future for SocketDriver {
-    type Output = io::Result<SocketEvent>;
+    type Output = io::Result<()>;
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let mut socket = self.socket.0.lock("UdxSocket::poll_drive");
-        let ev = socket.poll_drive(cx);
+        let mut socket = self.0.lock("UdxSocket::poll_drive");
+        let should_continue = socket.poll_drive(cx)?;
         drop(socket);
-        ev
+        if should_continue {
+            cx.waker().wake_by_ref();
+        }
+        Poll::Pending
     }
 }
 
 pub struct UdxSocketInner {
     socket: UdpSocket,
-    send_rx: Receiver<Arc<Packet>>,
-    send_tx: Sender<Arc<Packet>>,
+    send_rx: Receiver<PacketRef>,
+    send_tx: Sender<PacketRef>,
     streams: HashMap<u32, StreamHandle>,
-    pending_send: Option<Arc<Packet>>,
+    pending_send: Option<PacketRef>,
     read_buf: Vec<u8>,
 }
 
@@ -151,7 +140,10 @@ impl UdxSocketInner {
             packet.header.ack,
             packet.transmits.load(Ordering::SeqCst)
         );
-        match self.socket.poll_send_to(cx, &packet.buf, packet.dest) {
+        match self
+            .socket
+            .poll_send_to(cx, &packet.buf.as_slice(), packet.dest)
+        {
             Poll::Pending => Ok(false),
             Poll::Ready(Err(err)) => Err(err),
             Poll::Ready(Ok(n)) => {
@@ -164,15 +156,11 @@ impl UdxSocketInner {
         }
     }
 
-    fn poll_transmit(&mut self, cx: &mut Context<'_>) -> io::Result<()> {
+    fn poll_transmit(&mut self, cx: &mut Context<'_>) -> io::Result<bool> {
         // process transmits
         let mut iters = 0;
-        loop {
+        while iters < MAX_LOOP {
             iters += 1;
-            if iters > MAX_LOOP {
-                cx.waker().wake_by_ref();
-                break;
-            }
             if let Some(packet) = self.pending_send.take() {
                 if self.poll_send_packet(cx, &packet)? {
                     // packet.transmits.fetch_add(1, Ordering::SeqCst);
@@ -190,18 +178,14 @@ impl UdxSocketInner {
                 }
             }
         }
-        Ok(())
+        Ok(iters == MAX_LOOP)
     }
 
-    fn poll_recv(&mut self, cx: &mut Context<'_>) -> io::Result<()> {
+    fn poll_recv(&mut self, cx: &mut Context<'_>) -> io::Result<bool> {
         // process recv
         let mut iters = 0;
-        loop {
+        while iters < MAX_LOOP {
             iters += 1;
-            if iters > MAX_LOOP {
-                cx.waker().wake_by_ref();
-                break;
-            }
             let (len, header, _peer) = {
                 // todo: vectorize
                 let mut buf = ReadBuf::new(&mut self.read_buf);
@@ -239,13 +223,14 @@ impl UdxSocketInner {
                 }
             }
         }
-        Ok(())
+        Ok(iters == MAX_LOOP)
     }
 
-    fn poll_drive(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<SocketEvent>> {
-        self.poll_recv(cx)?;
-        self.poll_transmit(cx)?;
-        Poll::Pending
+    fn poll_drive(&mut self, cx: &mut Context<'_>) -> io::Result<bool> {
+        let mut should_continue = false;
+        should_continue |= self.poll_recv(cx)?;
+        should_continue |= self.poll_transmit(cx)?;
+        Ok(should_continue)
     }
 }
 

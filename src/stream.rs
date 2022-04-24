@@ -19,21 +19,22 @@ use crate::constants::{
 };
 use crate::error::UdxError;
 use crate::mutex::Mutex;
-use crate::packet::{Header, IncomingPacket, Packet};
+use crate::packet::{Header, IncomingPacket, Packet, PacketRef};
 use crate::socket::EventIncoming;
 
 const SSTHRESH: usize = 0xffff;
 
-pub struct StreamDriver {
-    stream: UdxStream,
-}
+#[derive(Clone)]
+pub struct UdxStream(Arc<Mutex<UdxStreamInner>>);
+
+pub struct StreamDriver(UdxStream);
 
 impl Future for StreamDriver {
-    type Output = ();
+    type Output = io::Result<()>;
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         {
-            let mut stream = self.stream.0.lock("UdxStream::poll_drive");
-            let should_continue = stream.poll_drive(cx);
+            let mut stream = self.0 .0.lock("UdxStream::poll_drive");
+            let should_continue = stream.poll_drive(cx)?;
             if should_continue {
                 drop(stream);
                 cx.waker().wake_by_ref();
@@ -46,20 +47,10 @@ impl Future for StreamDriver {
     }
 }
 
-#[derive(Clone)]
-pub struct UdxStream(Arc<Mutex<UdxStreamInner>>);
-
-impl Debug for UdxStream {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let inner = self.0.lock("UdxStream::debug");
-        write!(f, "{:#?}", &*inner)
-    }
-}
-
 impl UdxStream {
     pub(crate) fn connect(
         recv_rx: Receiver<EventIncoming>,
-        send_tx: Sender<Arc<Packet>>,
+        send_tx: Sender<PacketRef>,
         dest: SocketAddr,
         // _local_id: u32,
         remote_id: u32,
@@ -90,10 +81,12 @@ impl UdxStream {
             error: None,
         };
         let stream = UdxStream(Arc::new(Mutex::new(stream)));
-        let driver = StreamDriver {
-            stream: stream.clone(),
-        };
-        tokio::task::spawn(async move { driver.await });
+        let driver = StreamDriver(stream.clone());
+        tokio::task::spawn(async move {
+            if let Err(err) = driver.await {
+                tracing::error!("Stream closed with error: {}", err);
+            }
+        });
         stream
     }
 }
@@ -130,36 +123,31 @@ impl AsyncWrite for UdxStream {
 
 #[derive(Debug)]
 pub(crate) struct UdxStreamInner {
-    incoming: BTreeMap<u32, IncomingPacket>,
-    outgoing: HashMap<u32, Arc<Packet>>,
-    send_tx: Sender<Arc<Packet>>,
+    send_tx: Sender<PacketRef>,
     recv_rx: Receiver<EventIncoming>,
 
-    pub seq: u32,
-    pub remote_acked: u32,
-    pub ack: u32,
+    incoming: BTreeMap<u32, IncomingPacket>,
+    outgoing: HashMap<u32, Arc<Packet>>,
+    send_queue: VecDeque<PacketRef>,
 
-    srtt: Duration,
-    rttvar: Duration,
+    remote_id: u32,
+    remote_addr: SocketAddr,
 
+    seq: u32,
+    ack: u32,
+    remote_acked: u32,
     inflight: usize,
     cwnd: usize,
+    rto: Duration,
+    rto_timeout: Pin<Box<Sleep>>,
+    rttvar: Duration,
+    srtt: Duration,
 
     read_cursor: u32,
 
-    // pkts_waiting: usize,
     read_waker: Option<Waker>,
     write_waker: Option<Waker>,
-    pub(crate) drive_waker: Option<Waker>,
-
-    pub remote_id: u32,
-    // pub local_id: u32,
-    remote_addr: SocketAddr,
-
-    send_queue: VecDeque<Arc<Packet>>,
-
-    rto: Duration,
-    rto_timeout: Pin<Box<Sleep>>,
+    drive_waker: Option<Waker>,
 
     error: Option<UdxError>,
 }
@@ -176,18 +164,24 @@ impl UdxStreamInner {
         }
     }
 
-    fn create_packet(&self, typ: u32, body: &[u8]) -> Arc<Packet> {
+    fn create_packet(&self, typ: u32, body: &[u8]) -> Packet {
         let header = self.create_header(typ);
         let dest = self.remote_addr;
-        Arc::new(Packet::new(dest, header, body))
+        Packet::new(dest, header, body)
     }
 
-    fn poll_drive(&mut self, cx: &mut Context<'_>) -> bool {
+    fn poll_drive(&mut self, cx: &mut Context<'_>) -> io::Result<bool> {
         match self.poll_drive_inner(cx) {
-            Ok(should_continue) => should_continue,
+            Ok(should_continue) => Ok(should_continue),
             Err(error) => {
-                self.error = Some(error.into());
-                false
+                self.error = Some((&error).into());
+                if let Some(waker) = self.read_waker.take() {
+                    waker.wake();
+                }
+                if let Some(waker) = self.write_waker.take() {
+                    waker.wake();
+                }
+                Err(error)
             }
         }
     }
@@ -236,7 +230,7 @@ impl UdxStreamInner {
                 match may_retransmit {
                     Ok(_) => {
                         trace!("queue retransmit {}", packet.header.seq);
-                        self.send_queue.push_back(packet.clone());
+                        self.send_queue.push_back(PacketRef::Shared(packet.clone()));
                     }
                     Err(_) => {
                         return Err(io::Error::new(
@@ -283,10 +277,6 @@ impl UdxStreamInner {
             self.ack += 1;
             self.send_state_packet();
         }
-        // let mut incoming = self.incoming.keys().collect::<Vec<_>>();
-        // incoming.sort();
-        // eprintln!("send acks {}", self.ack);
-        // eprintln!("INC {:?}", incoming);
     }
 
     fn handle_remote_ack(&mut self, ack: u32) {
@@ -294,16 +284,12 @@ impl UdxStreamInner {
             return;
         }
 
-        // eprintln!("ACK {}", seq);
-        // let mut outgoing = self.outgoing.keys().collect::<Vec<_>>();
-        // outgoing.sort();
-        // eprintln!("out {:?}", outgoing);
         while self.remote_acked < ack {
             // TODO: Clear from send queue.
             self.remote_acked += 1;
             let packet = self.outgoing.remove(&(self.remote_acked - 1));
             if let Some(packet) = packet {
-                self.handle_ack(packet);
+                self.handle_ack(&packet);
             } else {
                 // Received invalid ack (too high)
                 tracing::error!("received invalid ack (too high)");
@@ -311,7 +297,7 @@ impl UdxStreamInner {
         }
     }
 
-    fn handle_ack(&mut self, packet: Arc<Packet>) {
+    fn handle_ack(&mut self, packet: &Packet) {
         self.inflight -= packet.buf.len();
 
         // recalculate timings
@@ -337,8 +323,6 @@ impl UdxStreamInner {
                 .max(self.srtt + UDX_CLOCK_GRANULARITY_MS.max(4 * self.rttvar));
         }
 
-        // reset rto
-        // self.rto = Duration::from_millis(100);
         self.rto_timeout
             .as_mut()
             .reset(tokio::time::Instant::now().checked_add(self.rto).unwrap());
@@ -348,12 +332,6 @@ impl UdxStreamInner {
                 waker.wake();
             }
         }
-        // self.remote_acked = seq;
-        // if !self.pending_sends_reached() {
-        //     if let Some(waker) = self.write_waker.take() {
-        //         waker.wake();
-        //     }
-        // }
     }
 
     fn handle_incoming(&mut self, packet: IncomingPacket) {
@@ -369,7 +347,6 @@ impl UdxStreamInner {
         // process incoming data
         if packet.has_type(UDX_HEADER_DATA) {
             let seq = packet.seq();
-            debug!("INCOMING {} (ack {})", seq, self.ack);
             if seq >= self.ack {
                 self.incoming.insert(seq, packet);
             }
@@ -403,7 +380,7 @@ impl UdxStreamInner {
 
     fn send_state_packet(&mut self) {
         let packet = self.create_packet(0, &[]);
-        self.send_queue.push_back(packet);
+        self.send_queue.push_back(PacketRef::Owned(packet));
         self.wake_driver();
     }
 
@@ -413,9 +390,10 @@ impl UdxStreamInner {
             return 0;
         }
         let packet = self.create_packet(UDX_HEADER_DATA, &buf[..len]);
+        let packet = Arc::new(packet);
         self.inflight += packet.buf.len();
         self.outgoing.insert(packet.seq(), Arc::clone(&packet));
-        self.send_queue.push_back(packet);
+        self.send_queue.push_back(PacketRef::Shared(packet));
         self.seq += 1;
         self.wake_driver();
         len
@@ -437,11 +415,11 @@ impl AsyncWrite for UdxStreamInner {
         let mut written = 0;
         loop {
             if written >= buf.len() {
-                break Poll::Ready(Ok(written));
+                return Poll::Ready(Ok(written));
             }
             let n = self.send_data_packet(&buf[written..]);
             if n == 0 {
-                break if written == 0 {
+                return if written == 0 {
                     self.write_waker = Some(cx.waker().clone());
                     Poll::Pending
                 } else {
@@ -466,11 +444,11 @@ impl AsyncRead for UdxStreamInner {
         cx: &mut Context<'_>,
         buf: &mut tokio::io::ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
-        trace!(
-            "poll read @ {} incoming len {}",
-            self.ack,
-            self.incoming.len()
-        );
+        // trace!(
+        //     "poll read @ {} incoming len {}",
+        //     self.ack,
+        //     self.incoming.len()
+        // );
         if let Some(error) = &self.error {
             return Poll::Ready(Err(error.clone().into()));
         }
@@ -481,13 +459,20 @@ impl AsyncRead for UdxStreamInner {
         } else {
             Poll::Ready(Ok(()))
         };
-        debug!(
-            "poll read res {:?} did_read {} filled {} remaining {}",
-            res,
-            did_read,
-            buf.filled().len(),
-            buf.remaining()
-        );
+        // debug!(
+        //     "poll read res {:?} did_read {} filled {} remaining {}",
+        //     res,
+        //     did_read,
+        //     buf.filled().len(),
+        //     buf.remaining()
+        // );
         res
+    }
+}
+
+impl Debug for UdxStream {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let inner = self.0.lock("UdxStream::debug");
+        write!(f, "{:#?}", &*inner)
     }
 }

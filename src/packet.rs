@@ -1,16 +1,55 @@
 use bytes::Bytes;
 use std::fmt::{self, Debug};
+use std::sync::Arc;
 use std::time::Instant;
 use std::{io, net::SocketAddr, sync::atomic::AtomicUsize};
 
 use crate::constants::{UDX_HEADER_SIZE, UDX_MAGIC_BYTE, UDX_VERSION};
+
+#[derive(Debug)]
+pub(crate) enum PacketRef {
+    Owned(Packet),
+    Shared(Arc<Packet>),
+}
+
+impl std::ops::Deref for PacketRef {
+    type Target = Packet;
+    fn deref(&self) -> &Self::Target {
+        match self {
+            PacketRef::Owned(packet) => &packet,
+            PacketRef::Shared(packet) => &packet,
+        }
+    }
+}
+
+pub enum PacketBuf {
+    Data(Vec<u8>),
+    HeaderOnly([u8; 20]),
+}
+impl PacketBuf {
+    pub fn as_slice(&self) -> &[u8] {
+        match self {
+            Self::Data(vec) => &vec[..],
+            Self::HeaderOnly(array) => &array[..],
+        }
+    }
+    pub fn as_mut_slice(&mut self) -> &mut [u8] {
+        match self {
+            Self::Data(vec) => &mut vec[..],
+            Self::HeaderOnly(array) => &mut array[..],
+        }
+    }
+    pub fn len(&self) -> usize {
+        self.as_slice().len()
+    }
+}
 
 pub(crate) struct Packet {
     pub time_sent: Instant,
     pub transmits: AtomicUsize,
     pub dest: SocketAddr,
     pub header: Header,
-    pub buf: Vec<u8>,
+    pub buf: PacketBuf,
 }
 
 impl fmt::Debug for Packet {
@@ -30,10 +69,16 @@ impl Packet {
     // }
 
     pub fn new(dest: SocketAddr, header: Header, body: &[u8]) -> Self {
-        let len = UDX_HEADER_SIZE + body.len();
-        let mut buf = vec![0u8; len];
-        header.encode(&mut buf[..UDX_HEADER_SIZE]);
-        buf[UDX_HEADER_SIZE..].copy_from_slice(body);
+        let mut buf = if body.is_empty() {
+            PacketBuf::HeaderOnly([0u8; 20])
+        } else {
+            let len = UDX_HEADER_SIZE + body.len();
+            PacketBuf::Data(vec![0u8; len])
+        };
+        header.encode(&mut buf.as_mut_slice()[..UDX_HEADER_SIZE]);
+        if !body.is_empty() {
+            buf.as_mut_slice()[UDX_HEADER_SIZE..].copy_from_slice(body);
+        }
         Self {
             time_sent: Instant::now(),
             transmits: AtomicUsize::new(0),

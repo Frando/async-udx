@@ -1,4 +1,6 @@
-use std::time::Duration;
+#![allow(dead_code)]
+
+use std::time::{Duration, Instant};
 use std::{future::Future, io};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::task::JoinHandle;
@@ -31,13 +33,14 @@ async fn main() -> io::Result<()> {
     let streamb = sockb.connect(addra, 2, 1)?;
 
     let message = vec![3u8; 3000];
-    let max_len = 1024 * 64;
+    let limit = 1024 * 1024 * 64;
+    let start = Instant::now();
     // let ra = spawn("read a", read_loop(streama.clone(), "a", max_len));
     let wa = spawn(
         "write a",
-        write_loop(streama.clone(), "a", message.clone(), max_len),
+        write_loop(streama.clone(), "a", message.clone(), limit),
     );
-    let rb = spawn("read b", read_loop(streamb.clone(), "b", max_len));
+    let rb = spawn("read b", read_loop(streamb.clone(), "b", limit));
     // let wb = spawn(
     //     "write b",
     //     write_loop(streamb.clone(), "b", message, max_len),
@@ -50,9 +53,12 @@ async fn main() -> io::Result<()> {
     // wb.await;
     // ra.await;
     rb.await;
-    tokio::time::sleep(Duration::from_secs(1)).await;
-    eprintln!("finish a {:?}", streama);
-    eprintln!("finish b {:?}", streamb);
+    let throughput = limit as f32 / start.elapsed().as_secs_f32() / (1024. * 1024.);
+    eprintln!("finish");
+    eprintln!("throughput: {} MB/s", throughput);
+    // tokio::time::sleep(Duration::from_secs(1)).await;
+    // eprintln!("finish a {:?}", streama);
+    // eprintln!("finish b {:?}", streamb);
     // tokio::time::sleep(Duration::from_millis(2000)).await;
     // eprintln!("streama {:#?}", *streama.lock(""));
     // eprintln!("streamb {:#?}", *streamb.lock(""));
