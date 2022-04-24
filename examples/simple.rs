@@ -3,7 +3,7 @@ use std::{future::Future, io};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::task::JoinHandle;
 
-use async_udx::simple::{UdxSocket, UdxStream};
+use async_udx::{UdxSocket, UdxStream};
 pub fn spawn<T>(name: impl ToString, future: T) -> JoinHandle<()>
 where
     T: Future<Output = io::Result<()>> + Send + 'static, // T::Output: Send + 'static,
@@ -27,8 +27,8 @@ async fn main() -> io::Result<()> {
     let mut sockb = UdxSocket::bind("127.0.0.1:20005").await?;
     let addrb = sockb.local_addr()?;
     eprintln!("sockb {addrb}");
-    let mut streama = socka.connect(addrb, 1, 2)?;
-    let mut streamb = sockb.connect(addra, 2, 1)?;
+    let streama = socka.connect(addrb, 1, 2)?;
+    let streamb = sockb.connect(addra, 2, 1)?;
 
     let message = vec![3u8; 3000];
     let max_len = 1024 * 64;
@@ -105,7 +105,7 @@ async fn read_loop(mut stream: UdxStream, name: &str, max_len: usize) -> io::Res
 
 async fn write_loop(
     mut stream: UdxStream,
-    name: &str,
+    _name: &str,
     message: Vec<u8>,
     max_len: usize,
 ) -> io::Result<()> {

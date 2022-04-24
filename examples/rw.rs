@@ -1,10 +1,10 @@
 use std::net::{SocketAddr, ToSocketAddrs};
-use std::time::Duration;
+
 use std::{future::Future, io};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::task::JoinHandle;
 
-use async_udx::simple::{UdxSocket, UdxStream};
+use async_udx::{UdxSocket, UdxStream};
 
 pub fn spawn<T>(name: impl ToString, future: T) -> JoinHandle<()>
 where
@@ -35,7 +35,7 @@ async fn main() -> io::Result<()> {
         .expect("invalid connect addr");
     eprintln!("{} -> {}", listen_addr, connect_addr);
     let mut sock = UdxSocket::bind(listen_addr).await?;
-    let mut stream = sock.connect(connect_addr, 1, 1)?;
+    let stream = sock.connect(connect_addr, 1, 1)?;
     let max_len = 100;
     let read = spawn("read", read_loop(stream.clone(), "read", max_len));
     let write = spawn(

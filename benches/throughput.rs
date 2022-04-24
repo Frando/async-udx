@@ -1,13 +1,10 @@
-use std::{
-    io,
-    time::{Duration, Instant},
-};
+use std::{io, time::Instant};
 use tokio::{
-    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader, BufWriter},
+    io::{AsyncReadExt, AsyncWriteExt, BufReader},
     net::TcpStream,
 };
 
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 criterion_group!(server_benches, bench_throughput);
 criterion_main!(server_benches);
 fn rt() -> tokio::runtime::Runtime {
@@ -17,7 +14,7 @@ fn rt() -> tokio::runtime::Runtime {
         .build()
         .unwrap()
 }
-use async_udx::simple::{UdxSocket, UdxStream};
+use async_udx::{UdxSocket, UdxStream};
 // use async_udx::{UdxSocket, UdxStream};
 fn bench_throughput(c: &mut Criterion) {
     tracing_subscriber::fmt().init();
@@ -64,8 +61,8 @@ fn bench_throughput(c: &mut Criterion) {
                 let mut read_buf = vec![0u8; limit];
                 let mut rb = BufReader::new(wb);
                 let start = Instant::now();
-                let message = vec![1u8; limit];
-                for i in 0..iters {
+                let _message = vec![1u8; limit];
+                for _i in 0..iters {
                     // eprintln!("####### ITER {}", i);
                     let twa = tokio::spawn(async move {
                         let message = vec![1u8; limit];
@@ -126,7 +123,7 @@ async fn setup_pipe_tcp() -> io::Result<(TcpStream, TcpStream)> {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
     let addr = listener.local_addr()?;
     let writer = tokio::task::spawn(async move {
-        let (stream, peer_addr) = listener.accept().await.unwrap();
+        let (stream, _peer_addr) = listener.accept().await.unwrap();
         stream
     });
     let reader = tokio::net::TcpStream::connect(addr).await?;
