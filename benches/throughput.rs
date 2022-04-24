@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 use std::{io, time::Instant};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt, BufReader},

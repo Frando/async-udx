@@ -25,9 +25,9 @@ impl fmt::Debug for Packet {
 }
 
 impl Packet {
-    pub fn has_type(&self, typ: u32) -> bool {
-        self.header.typ & typ != 0
-    }
+    // pub fn has_type(&self, typ: u32) -> bool {
+    //     self.header.typ & typ != 0
+    // }
 
     pub fn new(dest: SocketAddr, header: Header, body: &[u8]) -> Self {
         let len = UDX_HEADER_SIZE + body.len();
@@ -89,9 +89,9 @@ pub struct Header {
 
 impl Header {
     const SIZE: usize = UDX_HEADER_SIZE;
-    pub fn has_typ(&self, typ: u32) -> bool {
-        self.typ & typ != 0
-    }
+    // pub fn has_typ(&self, typ: u32) -> bool {
+    //     self.typ & typ != 0
+    // }
     pub fn from_bytes(buf: &[u8]) -> io::Result<Self> {
         if buf.len() < UDX_HEADER_SIZE || buf[0] != UDX_MAGIC_BYTE || buf[1] != UDX_VERSION {
             return Err(io::Error::new(io::ErrorKind::InvalidData, "Bad header"));

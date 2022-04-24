@@ -1,38 +1,28 @@
 use futures::Future;
+use std::collections::HashMap;
 use std::collections::{BTreeMap, VecDeque};
 use std::fmt::{self, Debug};
+use std::io;
+use std::net::SocketAddr;
+use std::pin::Pin;
 use std::sync::atomic::Ordering;
+use std::sync::Arc;
+use std::task::{Context, Poll, Waker};
 use std::time::{Duration, Instant};
-use std::{
-    collections::HashMap,
-    io,
-    net::SocketAddr,
-    pin::Pin,
-    sync::Arc,
-    task::{Context, Poll, Waker},
-};
-
-use tokio::sync::mpsc::{UnboundedReceiver as Receiver, UnboundedSender as Sender};
-use tracing::{debug, trace};
-// use tokio::sync::mpsc;
 use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::sync::mpsc::{UnboundedReceiver as Receiver, UnboundedSender as Sender};
 use tokio::time::Sleep;
+use tracing::{debug, trace};
 
-use crate::constants::{UDX_HEADER_DATA, UDX_MAX_DATA_SIZE, UDX_MAX_TRANSMITS};
-
+use crate::constants::{
+    UDX_CLOCK_GRANULARITY_MS, UDX_HEADER_DATA, UDX_MAX_DATA_SIZE, UDX_MAX_TRANSMITS, UDX_MTU,
+};
 use crate::error::UdxError;
 use crate::mutex::Mutex;
 use crate::packet::{Header, IncomingPacket, Packet};
 use crate::socket::EventIncoming;
 
-const UDX_MTU: usize = 1400;
-const UDX_CLOCK_GRANULARITY_MS: Duration = Duration::from_millis(20);
-
-const MAX_TRANSMITS: u8 = UDX_MAX_TRANSMITS;
-
 const SSTHRESH: usize = 0xffff;
-
-const MAX_LOOP: usize = 50;
 
 pub struct StreamDriver {
     stream: UdxStream,
@@ -71,14 +61,14 @@ impl UdxStream {
         recv_rx: Receiver<EventIncoming>,
         send_tx: Sender<Arc<Packet>>,
         dest: SocketAddr,
-        local_id: u32,
+        // _local_id: u32,
         remote_id: u32,
     ) -> Self {
         let rto = Duration::from_millis(1000);
         let stream = UdxStreamInner {
             recv_rx,
             remote_id,
-            local_id,
+            // local_id,
             seq: 0,
             ack: 0,
             inflight: 0,
@@ -163,8 +153,7 @@ pub(crate) struct UdxStreamInner {
     pub(crate) drive_waker: Option<Waker>,
 
     pub remote_id: u32,
-    pub local_id: u32,
-
+    // pub local_id: u32,
     remote_addr: SocketAddr,
 
     send_queue: VecDeque<Arc<Packet>>,
@@ -177,7 +166,6 @@ pub(crate) struct UdxStreamInner {
 
 impl UdxStreamInner {
     fn create_header(&self, typ: u32) -> Header {
-        
         Header {
             stream_id: self.remote_id,
             typ,
@@ -238,7 +226,7 @@ impl UdxStreamInner {
                     Ordering::SeqCst,
                     Ordering::SeqCst,
                     |transmits| {
-                        if transmits >= MAX_TRANSMITS as usize {
+                        if transmits >= UDX_MAX_TRANSMITS as usize {
                             None
                         } else {
                             Some(transmits + 1)

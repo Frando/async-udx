@@ -1,38 +1,22 @@
 use futures::Future;
-
+use std::collections::HashMap;
 use std::fmt::Debug;
+use std::io;
+use std::net::SocketAddr;
+use std::pin::Pin;
 use std::sync::atomic::Ordering;
-use std::time::Duration;
-use std::{
-    collections::HashMap,
-    io,
-    net::SocketAddr,
-    pin::Pin,
-    sync::Arc,
-    task::{Context, Poll},
-};
+use std::sync::Arc;
+use std::task::{Context, Poll};
 use tokio::io::ReadBuf;
 use tokio::net::ToSocketAddrs;
+use tokio::net::UdpSocket;
 use tokio::sync::mpsc::{self, UnboundedReceiver as Receiver, UnboundedSender as Sender};
 use tracing::{debug, trace};
-// use tokio::sync::mpsc;
-
-use tokio::net::UdpSocket;
-
-use crate::packet::{Header, IncomingPacket, Packet};
 
 use crate::constants::UDX_HEADER_SIZE;
-use crate::constants::UDX_MAX_TRANSMITS;
 use crate::mutex::Mutex;
-
+use crate::packet::{Header, IncomingPacket, Packet};
 use crate::stream::UdxStream;
-
-const UDX_MTU: usize = 1400;
-const UDX_CLOCK_GRANULARITY_MS: Duration = Duration::from_millis(20);
-
-const MAX_TRANSMITS: u8 = UDX_MAX_TRANSMITS;
-
-const SSTHRESH: usize = 0xffff;
 
 const MAX_LOOP: usize = 50;
 
@@ -152,7 +136,7 @@ impl UdxSocketInner {
             remote_id
         );
         let (recv_tx, recv_rx) = mpsc::unbounded_channel();
-        let stream = UdxStream::connect(recv_rx, self.send_tx.clone(), dest, local_id, remote_id);
+        let stream = UdxStream::connect(recv_rx, self.send_tx.clone(), dest, remote_id);
         let handle = StreamHandle { recv_tx };
         self.streams.insert(local_id, handle);
         Ok(stream)
