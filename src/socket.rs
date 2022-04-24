@@ -225,7 +225,7 @@ impl UdxSocketInner {
                     Poll::Pending => break,
                     Poll::Ready(peer) => peer,
                 };
-                let header = Header::from_bytes(&buf.filled())?;
+                let header = Header::from_bytes(buf.filled())?;
                 (buf.filled().len(), header, peer)
             };
             trace!(

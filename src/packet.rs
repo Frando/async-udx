@@ -131,7 +131,7 @@ impl Header {
         buf[8..12].copy_from_slice(&self.recv_win.to_le_bytes());
         buf[12..16].copy_from_slice(&self.seq.to_le_bytes());
         buf[16..20].copy_from_slice(&self.ack.to_le_bytes());
-        return true;
+        true
     }
 }
 

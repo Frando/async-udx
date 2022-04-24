@@ -75,7 +75,7 @@ async fn write_loop(
     let mut len = 0;
     loop {
         let msg = format!(" {}#{} ", message, i);
-        stream.write_all(&msg.as_bytes()).await?;
+        stream.write_all(msg.as_bytes()).await?;
         len += msg.len();
         i += 1;
         if len > max_len {

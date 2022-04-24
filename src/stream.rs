@@ -177,15 +177,15 @@ pub(crate) struct UdxStreamInner {
 
 impl UdxStreamInner {
     fn create_header(&self, typ: u32) -> Header {
-        let header = Header {
+        
+        Header {
             stream_id: self.remote_id,
             typ,
             seq: self.seq,
             ack: self.ack,
             data_offset: 0,
             recv_win: u32::MAX,
-        };
-        header
+        }
     }
 
     fn create_packet(&self, typ: u32, body: &[u8]) -> Arc<Packet> {
@@ -291,7 +291,7 @@ impl UdxStreamInner {
     }
 
     fn send_acks(&mut self) {
-        while self.incoming.contains_key(&self.ack) == true {
+        while self.incoming.contains_key(&self.ack) {
             self.ack += 1;
             self.send_state_packet();
         }
@@ -443,7 +443,7 @@ impl AsyncWrite for UdxStreamInner {
         if let Some(error) = &self.error {
             return Poll::Ready(Err(error.clone().into()));
         }
-        if buf.len() == 0 {
+        if buf.is_empty() {
             return Poll::Ready(Ok(0));
         }
         let mut written = 0;
