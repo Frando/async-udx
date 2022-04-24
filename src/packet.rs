@@ -5,7 +5,7 @@ use std::{
     sync::{atomic::AtomicU32, Arc},
 };
 
-use crate::{constants::*, StreamRef, UdxBuf, UdxSocket, UdxStream};
+use crate::{constants::*, UdxBuf, UdxSocketInner, UdxStream, UdxStreamInner};
 
 #[derive(Debug)]
 pub enum PacketRef {
@@ -55,11 +55,11 @@ pub struct Packet {
 }
 
 impl Packet {
-    pub fn new_stream(r#type: u32, stream: &UdxStream, buf: Vec<u8>) -> Self {
+    pub fn new_stream(r#type: u32, stream: &UdxStreamInner, buf: Vec<u8>) -> Self {
         let header = Header {
             r#type,
             data_offset: 0,
-            local_id: stream.remote_id,
+            stream_id: stream.remote_id,
             recv_win: u32::MAX,
             seq: stream.seq,
             ack: stream.ack,
@@ -112,7 +112,7 @@ impl fmt::Debug for PacketContext {
 
 pub struct PktSend {
     pub packet: Box<Packet>,
-    pub handle: UdxSocket,
+    pub handle: UdxSocketInner,
     pub on_send: Option<OnSendCallback>,
 }
 
@@ -137,7 +137,7 @@ pub type OnStreamSendCallback = Box<dyn Fn() + Send + Sync + 'static>;
 pub struct Header {
     pub r#type: u32,
     pub data_offset: usize,
-    pub local_id: u32,
+    pub stream_id: u32,
     pub recv_win: u32,
     pub seq: u32,
     pub ack: u32,
@@ -167,7 +167,7 @@ impl Header {
             r#type,
             data_offset: data_offset as usize,
             recv_win,
-            local_id,
+            stream_id: local_id,
             seq,
             ack,
         })
@@ -187,7 +187,7 @@ impl Header {
         buf[1] = UDX_VERSION;
         buf[2..3].copy_from_slice(&(self.r#type as u8).to_le_bytes());
         buf[3..4].copy_from_slice(&(self.data_offset as u8).to_le_bytes());
-        buf[4..8].copy_from_slice(&self.local_id.to_le_bytes());
+        buf[4..8].copy_from_slice(&self.stream_id.to_le_bytes());
         buf[8..12].copy_from_slice(&self.recv_win.to_le_bytes());
         buf[12..16].copy_from_slice(&self.seq.to_le_bytes());
         buf[16..20].copy_from_slice(&self.ack.to_le_bytes());

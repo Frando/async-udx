@@ -16,16 +16,22 @@ use crate::packet::{
     PktStreamWrite,
 };
 
-use crate::{constants::*, seq_compare, seq_diff, ProcessRes, SocketRef, UdxSocket};
+use crate::{constants::*, seq_compare, seq_diff, ProcessRes, UdxSocket, UdxSocketInner};
 
 pub type Time = u64;
 
 #[derive(Debug)]
-pub struct StreamRef(Arc<Mutex<UdxStream>>);
+pub struct UdxStream(Arc<Mutex<UdxStreamInner>>);
 
 pub const MAX_WAITING: u32 = 8;
 
-impl AsyncWrite for StreamRef {
+// impl StreamRef {
+//     pub async fn close(&self) {
+//         self.inner.lock().close();
+//     }
+// }
+
+impl AsyncWrite for UdxStream {
     fn poll_write(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -59,7 +65,7 @@ impl AsyncWrite for StreamRef {
     // }
 }
 
-impl AsyncRead for StreamRef {
+impl AsyncRead for UdxStream {
     fn poll_read(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -91,22 +97,22 @@ impl AsyncRead for StreamRef {
     }
 }
 
-impl Clone for StreamRef {
+impl Clone for UdxStream {
     fn clone(&self) -> Self {
         // self.lock("clone").ref_count += 1;
         Self(self.0.clone())
     }
 }
 
-impl std::ops::Deref for StreamRef {
-    type Target = Mutex<UdxStream>;
+impl std::ops::Deref for UdxStream {
+    type Target = Mutex<UdxStreamInner>;
     fn deref(&self) -> &Self::Target {
         &self.0
     }
 }
 
-impl StreamRef {
-    pub fn new(stream: UdxStream) -> Self {
+impl UdxStream {
+    pub fn new(stream: UdxStreamInner) -> Self {
         Self(Arc::new(Mutex::new(stream)))
     }
 
@@ -120,7 +126,7 @@ impl StreamRef {
 
 #[derive(Derivative)]
 #[derivative(Debug)]
-pub struct UdxStream {
+pub struct UdxStreamInner {
     pub local_id: u32,
     pub remote_id: u32,
     // pub set_id: usize,
@@ -131,7 +137,7 @@ pub struct UdxStream {
     pub local_addr: Option<SocketAddr>,
 
     #[derivative(Debug = "ignore")]
-    pub socket: Option<SocketRef>,
+    pub socket: Option<UdxSocket>,
 
     pub seq: u32,
     pub ack: u32,
@@ -189,7 +195,7 @@ pub enum SendRes {
     NotSent,
 }
 
-impl UdxStream {
+impl UdxStreamInner {
     pub fn new(local_id: u32) -> Self {
         let rto = 1000;
         Self {
@@ -239,13 +245,13 @@ impl UdxStream {
         }
     }
 
-    pub fn connected(&self) -> bool {
-        return self.socket.is_some();
-    }
+    // pub fn connected(&self) -> bool {
+    //     return self.socket.is_some();
+    // }
 
     pub fn connect(
         &mut self,
-        socket: SocketRef,
+        socket: UdxSocket,
         local_addr: SocketAddr,
         remote_addr: SocketAddr,
         remote_id: u32,
@@ -264,9 +270,9 @@ impl UdxStream {
 
         self.remote_id = remote_id;
         self.remote_addr = Some(remote_addr);
-        // self.set_id = socket.streams_len();
         self.local_addr = Some(local_addr);
-        self.socket = Some(socket);
+        // self.set_id = socket.streams_len();
+        // self.socket = Some(socket);
 
         // handle->on_close = close_cb;
 
@@ -746,7 +752,7 @@ impl UdxStream {
         Ok(())
     }
 
-    fn flush_waiting_packets(&mut self) {
+    pub fn flush_waiting_packets(&mut self) {
         let _was_waiting = self.pkts_waiting;
         let mut seq = if self.retransmits_waiting > 0 {
             self.remote_acked

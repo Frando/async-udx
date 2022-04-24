@@ -2,7 +2,6 @@ use std::collections::HashMap;
 use std::fmt;
 use std::io;
 use std::task::{Context, Poll};
-
 use std::time::Duration;
 use std::{collections::VecDeque, net::SocketAddr, sync::Arc};
 use tokio::io::ReadBuf;
@@ -11,39 +10,38 @@ use tokio::task::JoinHandle;
 use tokio::time::Interval;
 
 use crate::get_milliseconds;
+use crate::mutex::Mutex;
 use crate::packet::{Header, Packet, PacketRef, PacketStatus};
 use crate::SendRes;
-use crate::{constants::*, AckRes, UdxStream};
-use crate::{StreamRef, UdxBuf};
+use crate::{constants::*, AckRes, UdxStreamInner};
+use crate::{UdxBuf, UdxStream};
 
-use crate::mutex::Mutex;
+pub struct UdxSocket(Arc<Mutex<UdxSocketInner>>);
 
-pub struct UdxHandle {
-    inner: Arc<Mutex<UdxSocket>>,
-}
-
-pub struct SocketRef(Arc<Mutex<UdxSocket>>);
-impl fmt::Debug for SocketRef {
+impl fmt::Debug for UdxSocket {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "SocketRef")
     }
 }
 
-// pub struct UdpSocket {
-//     watcher: Async<std::net::UdpSocket>,
-// }
-
-impl SocketRef {
-    pub fn new(socket: UdxSocket) -> Self {
-        Self(Arc::new(Mutex::new(socket)))
+impl UdxSocket {
+    pub async fn bind<A: ToSocketAddrs>(addr: A) -> io::Result<Self> {
+        let inner = UdxSocketInner::bind(addr).await?;
+        let socket = Self(Arc::new(Mutex::new(inner)));
+        socket.clone().drive();
+        Ok(socket)
     }
 
-    pub fn drive(&self) -> JoinHandle<io::Result<()>> {
+    pub fn local_addr(&self) -> io::Result<SocketAddr> {
+        self.0.lock("socket:local_addr").local_addr()
+    }
+
+    fn drive(&self) -> JoinHandle<io::Result<()>> {
         let this = self.clone();
         tokio::task::spawn(async move {
             loop {
                 let res = futures::future::poll_fn(|cx| {
-                    let res = this.0.lock("sock:outer poll_fn").poll(cx);
+                    let res = this.0.lock("sock:outer poll_fn").poll_drive(cx);
                     res
                 })
                 .await;
@@ -65,7 +63,7 @@ impl SocketRef {
         dest: SocketAddr,
         local_id: u32,
         remote_id: u32,
-    ) -> io::Result<StreamRef> {
+    ) -> io::Result<UdxStream> {
         let mut socket = self.0.lock("sock:connect");
         if socket.streams_len() > u16::MAX as usize {
             return Err(io::Error::new(
@@ -73,31 +71,31 @@ impl SocketRef {
                 "Too many streams open",
             ));
         }
-        let mut stream = UdxStream::new(local_id);
+        let mut stream = UdxStreamInner::new(local_id);
         let local_addr = socket.local_addr().unwrap();
         stream.connect(self.clone(), local_addr, dest, remote_id)?;
-        let stream = StreamRef::new(stream);
+        let stream = UdxStream::new(stream);
         socket.streams.insert(local_id, stream.clone());
         Ok(stream)
     }
 }
 
-impl Clone for SocketRef {
+impl Clone for UdxSocket {
     fn clone(&self) -> Self {
         // self.lock("clone").ref_count += 1;
         Self(self.0.clone())
     }
 }
 
-impl std::ops::Deref for SocketRef {
-    type Target = Mutex<UdxSocket>;
+impl std::ops::Deref for UdxSocket {
+    type Target = Mutex<UdxSocketInner>;
     fn deref(&self) -> &Self::Target {
         &self.0
     }
 }
 
 #[derive(Debug)]
-pub struct UdxSocket {
+pub struct UdxSocketInner {
     socket: UdpSocket,
     send_queue: VecDeque<Packet>,
     status: u32,
@@ -106,15 +104,14 @@ pub struct UdxSocket {
     ttl: u32,
     pending_closes: u32,
 
-    streams: HashMap<u32, StreamRef>,
+    streams: HashMap<u32, UdxStream>,
 
     read_buf: Vec<u8>,
-    write_buf: Vec<u8>,
-
+    // write_buf: Vec<u8>,
     timeout_interval: Interval,
 }
 
-impl UdxSocket {
+impl UdxSocketInner {
     pub async fn bind<A: ToSocketAddrs>(addr: A) -> io::Result<Self> {
         let ttl = UDX_DEFAULT_TTL;
         let socket = UdpSocket::bind(addr).await?;
@@ -128,8 +125,7 @@ impl UdxSocket {
             streams: HashMap::new(),
 
             read_buf: vec![0u8; 2048],
-            write_buf: vec![0u8; 2048],
-
+            // write_buf: vec![0u8; 2048],
             timeout_interval: tokio::time::interval(Duration::from_millis(
                 UDX_CLOCK_GRANULARITY_MS as u64,
             )),
@@ -143,6 +139,8 @@ impl UdxSocket {
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
         self.socket.local_addr()
     }
+
+    fn poll_next(&self, cx: &mut Context<'_>) {}
 
     fn try_poll_send_packet(&self, cx: &mut Context<'_>, packet: &Packet) -> io::Result<SendRes> {
         let buf0 = &packet.bufs[0];
@@ -186,7 +184,7 @@ impl UdxSocket {
     //     Ok(())
     // }
 
-    pub fn poll(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+    pub fn poll_drive(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         if self.status & UDX_SOCKET_CLOSING > 0 {
             return Poll::Ready(Err(io::Error::new(io::ErrorKind::Other, "Closed by user")));
         }
@@ -213,12 +211,22 @@ impl UdxSocket {
             // eprintln!("[poll] read {}", read);
         }
 
+        let interval_ticked = match self.timeout_interval.poll_tick(cx) {
+            Poll::Ready(_) => true,
+            Poll::Pending => false,
+        };
+        // register next wakeup.
+        // while !matches!(self.timeout_interval.poll_tick(cx), Poll::Pending) {}
         // Write packets out.
-        'send_packets: for stream in self.streams.values() {
-            let mut stream = stream.lock("stream:poll_send_queue");
-            match stream.check_timeouts() {
-                Ok(()) => {}
-                Err(err) => return Poll::Ready(Err(err)),
+        'send_packets: for stream_ref in self.streams.values() {
+            let mut stream = stream_ref.lock("stream:poll_send_queue:check_timeouts");
+            if interval_ticked {
+                match stream.check_timeouts() {
+                    Ok(()) => {}
+                    Err(err) => return Poll::Ready(Err(err)),
+                }
+            } else {
+                stream.flush_waiting_packets();
             }
             // TODO: This sorts packets always by streams, punishing later ids.
             while let Some(mut packet_ref) = stream.send_queue.pop_front() {
@@ -251,9 +259,6 @@ impl UdxSocket {
         //         .fold(0, |acc, stream| stream.send_queue.len() + acc)
         // );
 
-        // register next wakeup.
-        while !matches!(self.timeout_interval.poll_tick(cx), Poll::Pending) {}
-
         // always return pending - no need to call this again until either IO or the timeout is
         // reached.
         // TODO: Should be woken if new writes are queued in a stream?
@@ -266,7 +271,7 @@ impl UdxSocket {
             None => return Ok(ProcessRes::NotHandled),
         };
         // eprintln!("[{}] incoming {:?}", self.local_addr()?.port(), header);
-        let stream = match self.streams.get_mut(&header.local_id) {
+        let stream = match self.streams.get_mut(&header.stream_id) {
             Some(stream) => stream,
             None => {
                 // self.invoke_preconnect();
