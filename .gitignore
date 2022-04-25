@@ -1,3 +1,5 @@
 /target
 SANDBOX
 vendor
+perf.data*
+flamegraph*.svg
