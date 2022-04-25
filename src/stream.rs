@@ -1,4 +1,4 @@
-use futures::Future;
+use futures::{Future, FutureExt};
 use std::collections::HashMap;
 use std::collections::{BTreeMap, VecDeque};
 use std::fmt::{self, Debug};
@@ -11,18 +11,38 @@ use std::task::{Context, Poll, Waker};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::mpsc::{UnboundedReceiver as Receiver, UnboundedSender as Sender};
+use tokio::sync::oneshot;
 use tokio::time::Sleep;
-use tracing::{debug, trace};
+use tracing::trace;
 
 use crate::constants::{
-    UDX_CLOCK_GRANULARITY_MS, UDX_HEADER_DATA, UDX_MAX_DATA_SIZE, UDX_MAX_TRANSMITS, UDX_MTU,
+    UDX_CLOCK_GRANULARITY_MS, UDX_HEADER_DATA, UDX_HEADER_END, UDX_MAX_DATA_SIZE,
+    UDX_MAX_TRANSMITS, UDX_MTU,
 };
 use crate::error::UdxError;
-use crate::mutex::Mutex;
+use crate::mutex::{Mutex, MutexGuard};
 use crate::packet::{Header, IncomingPacket, Packet, PacketRef};
 use crate::socket::EventIncoming;
 
 const SSTHRESH: usize = 0xffff;
+
+#[derive(Debug, Default, Clone)]
+pub struct StreamStats {
+    pub pkts_transmitted: usize,
+    pub pkts_received: usize,
+    pub pkts_inflight: usize,
+
+    pub bytes_transmitted: usize,
+    pub bytes_received: usize,
+    pub bytes_inflight: usize,
+}
+
+#[derive(Debug)]
+enum StreamState {
+    Open,
+    LocalClosed,
+    RemoteClosed,
+}
 
 #[derive(Clone)]
 pub struct UdxStream(Arc<Mutex<UdxStreamInner>>);
@@ -30,20 +50,37 @@ pub struct UdxStream(Arc<Mutex<UdxStreamInner>>);
 pub struct StreamDriver(UdxStream);
 
 impl Future for StreamDriver {
-    type Output = io::Result<()>;
+    type Output = ();
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        {
-            let mut stream = self.0 .0.lock("UdxStream::poll_drive");
-            let should_continue = stream.poll_drive(cx)?;
-            if should_continue {
-                drop(stream);
-                cx.waker().wake_by_ref();
-                Poll::Pending
-            } else {
-                stream.drive_waker = Some(cx.waker().clone());
-                Poll::Pending
-            }
+        let mut stream = self.0.lock("UdxStream::poll_drive");
+        if stream.drive_waker.is_some() {
+            stream.drive_waker = None;
         }
+
+        let should_continue = stream.poll_drive(cx);
+
+        if stream.closed_and_drained() {
+            if let Some(tx) = stream.on_close.take() {
+                tx.send(()).ok();
+            }
+            return Poll::Ready(());
+        }
+
+        let should_continue = match should_continue {
+            Ok(should_continue) => should_continue,
+            Err(err) => {
+                stream.terminate(err);
+                false
+            }
+        };
+        if should_continue {
+            drop(stream);
+            cx.waker().wake_by_ref();
+        } else {
+            stream.drive_waker = Some(cx.waker().clone());
+        }
+
+        Poll::Pending
     }
 }
 
@@ -79,15 +116,36 @@ impl UdxStream {
             write_waker: None,
             drive_waker: None,
             error: None,
+            on_close: None,
+            stats: Default::default(),
+            state: StreamState::Open,
         };
         let stream = UdxStream(Arc::new(Mutex::new(stream)));
         let driver = StreamDriver(stream.clone());
-        tokio::task::spawn(async move {
-            if let Err(err) = driver.await {
-                tracing::error!("Stream closed with error: {}", err);
-            }
-        });
+        tokio::task::spawn(async move { driver.await });
         stream
+    }
+
+    pub fn close(&self) -> impl Future<Output = ()> {
+        let mut stream = self.lock("UdxStream::close");
+        stream.terminate(UdxError::close_graceful());
+        let (tx, rx) = oneshot::channel();
+        stream.on_close = Some(tx);
+        drop(stream);
+        let rx = rx.map(|_r| ());
+        rx
+    }
+
+    pub fn remote_addr(&self) -> SocketAddr {
+        self.lock("UdxStream::dest").remote_addr
+    }
+
+    pub fn stats(&self) -> StreamStats {
+        (*self.lock("UdxStream::stats").stats()).clone()
+    }
+
+    pub(crate) fn lock(&self, reason: &'static str) -> MutexGuard<'_, UdxStreamInner> {
+        self.0.lock(reason)
     }
 }
 
@@ -150,10 +208,18 @@ pub(crate) struct UdxStreamInner {
     drive_waker: Option<Waker>,
 
     error: Option<UdxError>,
+
+    on_close: Option<oneshot::Sender<()>>,
+
+    stats: StreamStats,
+    state: StreamState,
 }
 
 impl UdxStreamInner {
-    fn create_header(&self, typ: u32) -> Header {
+    fn create_header(&self, mut typ: u32) -> Header {
+        if matches!(self.state, StreamState::LocalClosed) {
+            typ = typ & UDX_HEADER_END;
+        }
         Header {
             stream_id: self.remote_id,
             typ,
@@ -170,24 +236,27 @@ impl UdxStreamInner {
         Packet::new(dest, header, body)
     }
 
-    fn poll_drive(&mut self, cx: &mut Context<'_>) -> io::Result<bool> {
-        match self.poll_drive_inner(cx) {
-            Ok(should_continue) => Ok(should_continue),
-            Err(error) => {
-                self.error = Some((&error).into());
-                if let Some(waker) = self.read_waker.take() {
-                    waker.wake();
-                }
-                if let Some(waker) = self.write_waker.take() {
-                    waker.wake();
-                }
-                Err(error)
-            }
+    fn terminate(&mut self, error: impl Into<UdxError>) {
+        self.error = Some(error.into());
+        self.state = StreamState::LocalClosed;
+        self.send_state_packet();
+
+        if let Some(waker) = self.read_waker.take() {
+            waker.wake();
         }
+        if let Some(waker) = self.write_waker.take() {
+            waker.wake();
+        }
+        self.wake_driver();
     }
-    fn poll_drive_inner(&mut self, cx: &mut Context<'_>) -> io::Result<bool> {
-        self.poll_incoming(cx);
+
+    fn closed_and_drained(&self) -> bool {
+        self.error.is_some() && self.send_queue.is_empty() && self.outgoing.is_empty()
+    }
+
+    fn poll_drive(&mut self, cx: &mut Context<'_>) -> io::Result<bool> {
         self.poll_check_timeouts(cx)?;
+        self.poll_incoming(cx)?;
         self.poll_transmit(cx);
         Ok(false)
     }
@@ -253,13 +322,18 @@ impl UdxStreamInner {
         }
     }
 
-    fn poll_incoming(&mut self, cx: &mut Context<'_>) {
+    fn poll_incoming(&mut self, cx: &mut Context<'_>) -> io::Result<()> {
         let mut remote_ack = 0;
         loop {
             let next_event = Pin::new(&mut self.recv_rx).poll_recv(cx);
             match next_event {
                 Poll::Pending => break,
-                Poll::Ready(None) => unimplemented!(),
+                Poll::Ready(None) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::BrokenPipe,
+                        "Socket driver future was dropped",
+                    ))
+                }
                 Poll::Ready(Some(event)) => match event {
                     EventIncoming::Packet(packet) => {
                         remote_ack = remote_ack.max(packet.ack());
@@ -270,6 +344,7 @@ impl UdxStreamInner {
         }
         self.send_acks();
         self.handle_remote_ack(remote_ack);
+        Ok(())
     }
 
     fn send_acks(&mut self) {
@@ -299,6 +374,8 @@ impl UdxStreamInner {
 
     fn handle_ack(&mut self, packet: &Packet) {
         self.inflight -= packet.buf.len();
+        self.stats.bytes_inflight -= packet.data_len();
+        self.stats.pkts_inflight -= 1;
 
         // recalculate timings
         let rtt = Instant::now() - packet.time_sent;
@@ -335,6 +412,7 @@ impl UdxStreamInner {
     }
 
     fn handle_incoming(&mut self, packet: IncomingPacket) {
+        self.stats.pkts_received += 1;
         // congestion control..
         if packet.ack() != self.remote_acked {
             if self.cwnd < SSTHRESH {
@@ -344,8 +422,14 @@ impl UdxStreamInner {
             }
         }
 
+        if packet.has_type(UDX_HEADER_END) {
+            self.state = StreamState::RemoteClosed;
+            self.terminate(UdxError::closed_by_remote());
+        }
+
         // process incoming data
         if packet.has_type(UDX_HEADER_DATA) {
+            self.stats.bytes_received += packet.data_len();
             let seq = packet.seq();
             if seq >= self.ack {
                 self.incoming.insert(seq, packet);
@@ -378,10 +462,15 @@ impl UdxStreamInner {
         Ok(did_read)
     }
 
+    fn stats(&self) -> &StreamStats {
+        &self.stats
+    }
+
     fn send_state_packet(&mut self) {
         let packet = self.create_packet(0, &[]);
         self.send_queue.push_back(PacketRef::Owned(packet));
         self.wake_driver();
+        self.stats.pkts_transmitted += 1;
     }
 
     fn send_data_packet(&mut self, buf: &[u8]) -> usize {
@@ -391,10 +480,17 @@ impl UdxStreamInner {
         }
         let packet = self.create_packet(UDX_HEADER_DATA, &buf[..len]);
         let packet = Arc::new(packet);
+
         self.inflight += packet.buf.len();
+        self.seq += 1;
+
+        self.stats.bytes_inflight += packet.data_len();
+        self.stats.bytes_transmitted += packet.data_len();
+        self.stats.pkts_transmitted += 1;
+        self.stats.pkts_inflight += 1;
+
         self.outgoing.insert(packet.seq(), Arc::clone(&packet));
         self.send_queue.push_back(PacketRef::Shared(packet));
-        self.seq += 1;
         self.wake_driver();
         len
     }

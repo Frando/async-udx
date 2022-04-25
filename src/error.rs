@@ -1,7 +1,7 @@
 use std::fmt;
 use std::io;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UdxError {
     kind: io::ErrorKind,
     reason: String,
@@ -22,6 +22,14 @@ impl UdxError {
             kind,
             reason: reason.to_string(),
         }
+    }
+
+    pub fn close_graceful() -> Self {
+        Self::new(io::ErrorKind::ConnectionReset, "")
+    }
+
+    pub fn closed_by_remote() -> Self {
+        Self::new(io::ErrorKind::UnexpectedEof, "")
     }
 }
 

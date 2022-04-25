@@ -91,6 +91,10 @@ impl Packet {
     pub fn seq(&self) -> u32 {
         self.header.seq
     }
+
+    pub fn data_len(&self) -> usize {
+        self.buf.len().checked_sub(UDX_HEADER_SIZE).unwrap_or(0)
+    }
 }
 
 pub(crate) struct IncomingPacket {
@@ -119,6 +123,9 @@ impl IncomingPacket {
     }
     pub fn has_type(&self, typ: u32) -> bool {
         self.header.typ & typ != 0
+    }
+    pub fn data_len(&self) -> usize {
+        self.buf.len()
     }
 }
 
