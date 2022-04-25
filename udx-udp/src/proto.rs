@@ -16,6 +16,15 @@ pub struct Transmit {
     pub src_ip: Option<IpAddr>,
 }
 
+impl Transmit {
+    pub fn num_segments(&self) -> usize {
+        match self.segment_size {
+            None => 1,
+            Some(size) => self.contents.len() / size,
+        }
+    }
+}
+
 impl fmt::Debug for Transmit {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Transmit")

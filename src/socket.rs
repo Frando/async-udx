@@ -61,7 +61,7 @@ impl UdxSocket {
     }
 
     pub fn connect(
-        &mut self,
+        &self,
         dest: SocketAddr,
         local_id: u32,
         remote_id: u32,
@@ -69,6 +69,10 @@ impl UdxSocket {
         self.0
             .lock("UdxSocket::connect")
             .connect(dest, local_id, remote_id)
+    }
+
+    pub fn stats(&self) -> SocketStats {
+        self.0.lock("UdxSocket::stats").stats.clone()
     }
 }
 
@@ -95,6 +99,16 @@ pub struct UdxSocketInner {
     pending_transmits: VecDeque<Transmit>,
     recv_buf: Box<[u8]>,
     udp_state: Arc<UdpState>,
+    stats: SocketStats,
+}
+
+#[derive(Default, Clone, Debug)]
+pub struct SocketStats {
+    tx_transmits: usize,
+    tx_dgrams: usize,
+    tx_bytes: usize,
+    rx_bytes: usize,
+    rx_dgrams: usize,
 }
 
 impl UdxSocketInner {
@@ -111,6 +125,7 @@ impl UdxSocketInner {
             recv_buf: recv_buf.into(),
             udp_state: Arc::new(UdpState::new()),
             pending_transmits: VecDeque::new(),
+            stats: SocketStats::default(),
         })
     }
 
@@ -153,6 +168,9 @@ impl UdxSocketInner {
                     Poll::Pending => break,
                     Poll::Ready(None) => unreachable!(),
                     Poll::Ready(Some(transmit)) => {
+                        self.stats.tx_bytes += transmit.contents.len();
+                        self.stats.tx_transmits += 1;
+                        self.stats.tx_dgrams += transmit.num_segments();
                         self.pending_transmits.push_back(transmit);
                     }
                 }
@@ -171,7 +189,7 @@ impl UdxSocketInner {
                     self.pending_transmits.drain(..n);
                 }
             }
-            if iters > 10 {
+            if iters > 1 {
                 break Ok(true);
             }
         }
@@ -203,6 +221,8 @@ impl UdxSocketInner {
                     for (meta, buf) in metas.iter().zip(iovs.iter()).take(msgs) {
                         let mut data: BytesMut = buf[0..meta.len].into();
                         let len = data.len();
+                        self.stats.rx_bytes += len;
+                        self.stats.rx_dgrams += 1;
                         match Header::from_bytes(&data) {
                             Err(_err) => {
                                 // received invalid header.

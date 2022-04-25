@@ -31,13 +31,12 @@ const MAX_SEGMENTS: usize = 10;
 
 #[derive(Debug, Default, Clone)]
 pub struct StreamStats {
-    pub pkts_transmitted: usize,
-    pub pkts_received: usize,
-    pub pkts_inflight: usize,
-
-    pub bytes_transmitted: usize,
-    pub bytes_received: usize,
-    pub bytes_inflight: usize,
+    pub tx_packets: usize,
+    pub tx_bytes: usize,
+    pub rx_bytes: usize,
+    pub rx_packets: usize,
+    pub inflight_packets: usize,
+    pub inflight_bytes: usize,
 }
 
 #[derive(Debug)]
@@ -142,7 +141,7 @@ impl UdxStream {
     }
 
     pub fn remote_addr(&self) -> SocketAddr {
-        self.lock("UdxStream::dest").remote_addr
+        self.lock("UdxStream::remote_addr").remote_addr
     }
 
     pub fn stats(&self) -> StreamStats {
@@ -409,8 +408,8 @@ impl UdxStreamInner {
 
     fn handle_ack(&mut self, packet: &Packet) {
         self.inflight -= packet.buf.len();
-        self.stats.bytes_inflight -= packet.data_len();
-        self.stats.pkts_inflight -= 1;
+        self.stats.inflight_bytes -= packet.data_len();
+        self.stats.inflight_packets -= 1;
 
         // recalculate timings
         let rtt = Instant::now() - packet.time_sent;
@@ -447,7 +446,7 @@ impl UdxStreamInner {
     }
 
     fn handle_incoming(&mut self, packet: IncomingPacket) {
-        self.stats.pkts_received += 1;
+        self.stats.rx_packets += 1;
         // congestion control..
         if packet.ack() != self.remote_acked {
             if self.cwnd < SSTHRESH {
@@ -464,7 +463,7 @@ impl UdxStreamInner {
 
         // process incoming data
         if packet.has_type(UDX_HEADER_DATA) {
-            self.stats.bytes_received += packet.data_len();
+            self.stats.rx_bytes += packet.data_len();
             let seq = packet.seq();
             if seq >= self.ack {
                 self.incoming.insert(seq, packet);
@@ -505,7 +504,7 @@ impl UdxStreamInner {
         let packet = self.create_packet(0, &[]);
         self.send_queue.push_back(PacketRef::Owned(packet));
         self.wake_driver();
-        self.stats.pkts_transmitted += 1;
+        self.stats.tx_packets += 1;
     }
 
     fn send_data_packet(&mut self, buf: &[u8]) -> usize {
@@ -519,10 +518,10 @@ impl UdxStreamInner {
         self.inflight += packet.buf.len();
         self.seq += 1;
 
-        self.stats.bytes_inflight += packet.data_len();
-        self.stats.bytes_transmitted += packet.data_len();
-        self.stats.pkts_transmitted += 1;
-        self.stats.pkts_inflight += 1;
+        self.stats.inflight_bytes += packet.data_len();
+        self.stats.tx_bytes += packet.data_len();
+        self.stats.tx_packets += 1;
+        self.stats.inflight_packets += 1;
 
         self.outgoing.insert(packet.seq(), Arc::clone(&packet));
         self.send_queue.push_back(PacketRef::Shared(packet));
@@ -612,11 +611,11 @@ fn queue_transmits(
     transmits: &mut VecDeque<Transmit>,
     queue: &mut VecDeque<PacketRef>,
     segment_size: usize,
-    max_transmits: usize,
-    remote_addr: SocketAddr,
+    max_segments: usize,
+    destination: SocketAddr,
 ) {
     while !queue.is_empty() {
-        let segments = queue.len().min(max_transmits);
+        let segments = queue.len().min(max_segments);
         let size = segments * segment_size;
         let mut buf = Vec::with_capacity(size);
         for _ in 0..segments {
@@ -624,11 +623,14 @@ fn queue_transmits(
             buf.put_slice(packet.buf.as_slice());
         }
         let transmit = Transmit {
-            destination: remote_addr,
+            destination,
             ecn: None,
             src_ip: None,
-            segment_size: Some(UDX_MTU),
             contents: buf,
+            segment_size: match segments {
+                1 => None,
+                _ => Some(segment_size),
+            },
         };
         transmits.push_back(transmit);
     }

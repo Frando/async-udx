@@ -23,15 +23,15 @@ async fn stream_close() -> io::Result<()> {
     // write a message.
     let msg = vec![1, 2, 3];
     streama.write_all(&msg).await?;
-    assert_eq!(streama.stats().pkts_inflight, 1);
+    assert_eq!(streama.stats().inflight_packets, 1);
 
     // close the stream
     let close = streama.close();
-    assert_eq!(streama.stats().pkts_inflight, 1);
+    assert_eq!(streama.stats().inflight_packets, 1);
 
     // wait until closing is complete == all packages flushed
     close.await;
-    assert_eq!(streama.stats().pkts_inflight, 0);
+    assert_eq!(streama.stats().inflight_packets, 0);
 
     // ensure reading on other end still works
     let mut read = vec![0u8; 3];

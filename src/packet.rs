@@ -1,8 +1,10 @@
-use bytes::Bytes;
+use bytes::{BufMut, Bytes};
+use std::collections::VecDeque;
 use std::fmt::{self, Debug};
 use std::sync::Arc;
 use std::time::Instant;
 use std::{io, net::SocketAddr, sync::atomic::AtomicUsize};
+use udx_udp::Transmit;
 
 use crate::constants::{UDX_HEADER_SIZE, UDX_MAGIC_BYTE, UDX_VERSION};
 
@@ -10,6 +12,67 @@ use crate::constants::{UDX_HEADER_SIZE, UDX_MAGIC_BYTE, UDX_VERSION};
 pub(crate) enum PacketRef {
     Owned(Packet),
     Shared(Arc<Packet>),
+}
+
+// invariant: all packets need to have the same size if segment_size is set!!
+pub struct PacketSet {
+    dest: SocketAddr,
+    segment_size: Option<usize>,
+    packets: Vec<PacketRef>,
+}
+
+impl PacketSet {
+    fn into_transmits(&self, max_segments: usize) -> VecDeque<Transmit> {
+        match self.segment_size {
+            None => self
+                .packets
+                .iter()
+                .map(|packet| packet.to_transmit())
+                .collect(),
+            Some(segment_size) => {
+                let mut transmits = VecDeque::new();
+                queue_transmits(
+                    &mut transmits,
+                    &self.packets,
+                    segment_size,
+                    max_segments,
+                    self.dest,
+                );
+                transmits
+            }
+        }
+    }
+}
+
+fn queue_transmits(
+    transmits: &mut VecDeque<Transmit>,
+    packets: &[PacketRef],
+    segment_size: usize,
+    max_segments: usize,
+    destination: SocketAddr,
+) {
+    let mut i = 0;
+    while i < packets.len() {
+        let segments = (packets.len() - i).min(max_segments);
+        let size = segments * segment_size;
+        let mut buf = Vec::with_capacity(size);
+        for j in 0..segments {
+            let packet = packets.get(i + j).unwrap();
+            buf.put_slice(packet.buf.as_slice());
+        }
+        let transmit = Transmit {
+            destination,
+            ecn: None,
+            src_ip: None,
+            contents: buf,
+            segment_size: match segments {
+                1 => None,
+                _ => Some(segment_size),
+            },
+        };
+        transmits.push_back(transmit);
+        i += 1;
+    }
 }
 
 impl std::ops::Deref for PacketRef {
@@ -42,6 +105,13 @@ impl PacketBuf {
     pub fn len(&self) -> usize {
         self.as_slice().len()
     }
+
+    pub fn into_vec(self) -> Vec<u8> {
+        match self {
+            Self::Data(buf) => buf,
+            Self::HeaderOnly(buf) => buf.into(),
+        }
+    }
 }
 
 pub(crate) struct Packet {
@@ -63,11 +133,19 @@ impl fmt::Debug for Packet {
     }
 }
 
-impl Packet {
-    // pub fn has_type(&self, typ: u32) -> bool {
-    //     self.header.typ & typ != 0
-    // }
+impl From<Packet> for Transmit {
+    fn from(packet: Packet) -> Self {
+        Transmit {
+            ecn: None,
+            src_ip: None,
+            destination: packet.dest,
+            segment_size: None,
+            contents: packet.buf.into_vec(),
+        }
+    }
+}
 
+impl Packet {
     pub fn new(dest: SocketAddr, header: Header, body: &[u8]) -> Self {
         let mut buf = if body.is_empty() {
             PacketBuf::HeaderOnly([0u8; 20])
@@ -94,6 +172,16 @@ impl Packet {
 
     pub fn data_len(&self) -> usize {
         self.buf.len().checked_sub(UDX_HEADER_SIZE).unwrap_or(0)
+    }
+
+    fn to_transmit(&self) -> Transmit {
+        Transmit {
+            ecn: None,
+            src_ip: None,
+            destination: self.dest,
+            segment_size: None,
+            contents: self.buf.as_slice().to_vec(),
+        }
     }
 }
 
