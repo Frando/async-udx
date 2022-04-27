@@ -72,6 +72,7 @@ impl UdpSocket {
             if let Ok(res) =
                 guard.try_io(|io| send(state, io.get_ref(), last_send_error, transmits))
             {
+                // eprintln!("send res {:?}", res);
                 return Poll::Ready(res);
             }
         }
@@ -249,10 +250,20 @@ fn send(
             unsafe { libc::sendmmsg(io.as_raw_fd(), msgs.as_mut_ptr(), num_transmits as u32, 0) };
         if n == -1 {
             let e = io::Error::last_os_error();
+            // tracing::error!("last os err {:?}", e.raw_os_error());
             match e.kind() {
                 io::ErrorKind::Interrupted => {
+                    // tracing::warn!("interrupt!!");
                     // Retry the transmission
                     continue;
+                }
+                // On linux, when sending too many packages at once, a permission denied error is
+                // thrown. Treat as WouldBlock to reschedule once the kernel buffer is drained.
+                io::ErrorKind::PermissionDenied => {
+                    // continue;
+                    // tracing::warn!("send overflow");
+                    return Err(io::Error::new(io::ErrorKind::WouldBlock, ""));
+                    // return Err(io::Error::new(io::ErrorKind::Interrupted, ""));
                 }
                 io::ErrorKind::WouldBlock => return Err(e),
                 _ => {
@@ -277,6 +288,12 @@ fn send(
                     //   Those are not fatal errors, since the
                     //   configuration can be dynamically changed.
                     // - Destination unreachable errors have been observed for other
+                    tracing::error!(
+                        "last {:?} err {:?} trans {:?}",
+                        last_send_error,
+                        e,
+                        transmits
+                    );
                     log_sendmsg_error(last_send_error, e, &transmits[0]);
 
                     // The ERRORS section in https://man7.org/linux/man-pages/man2/sendmmsg.2.html
@@ -284,6 +301,7 @@ fn send(
                     // at all. Therefore drop the first (problematic) message,
                     // and retry the remaining ones.
                     return Ok(num_transmits.min(1));
+                    // continue;
                 }
             }
         }

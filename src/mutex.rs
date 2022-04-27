@@ -75,6 +75,15 @@ mod tracking {
         purpose: &'static str,
     }
 
+    impl<'a, T> Debug for MutexGuard<'a, T>
+    where
+        T: Debug,
+    {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            std::fmt::Debug::fmt(&self.guard, f)
+        }
+    }
+
     impl<'a, T> Drop for MutexGuard<'a, T> {
         fn drop(&mut self) {
             if self.guard.last_lock_owner.len() == MAX_LOCK_OWNERS {

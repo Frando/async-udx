@@ -20,6 +20,7 @@ pub const UDX_VERSION: u8 = 1;
 
 pub const UDX_DEFAULT_TTL: u32 = 64;
 pub const UDX_MTU: usize = 1400;
+pub const UDX_DATA_MTU: usize = UDX_MTU - UDX_HEADER_SIZE;
 pub const UDX_SOCKET_RECEIVING: u32 = 1;
 pub const UDX_SOCKET_BOUND: u32 = 2;
 pub const UDX_SOCKET_CLOSING: u32 = 4;

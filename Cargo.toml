@@ -18,6 +18,8 @@ tracing-subscriber = "0.3.11"
 bytes = "1.1.0"
 log = "0.4.16"
 udx-udp = { path = "./udx-udp" }
+atomic-instant = "0.1.1"
+quanta = "0.9.3"
 
 [dev-dependencies]
 criterion = { version = "0.3", features = ["async_tokio"] }
@@ -28,7 +30,8 @@ name = "throughput"
 harness = false
 
 [features]
-default = ["lock_tracking"]
+# default = ["lock_tracking"]
+default = []
 lock_tracking = []
 
 [workspace]

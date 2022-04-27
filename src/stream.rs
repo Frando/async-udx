@@ -1,4 +1,3 @@
-use bytes::BufMut;
 use futures::{Future, FutureExt};
 use std::collections::HashMap;
 use std::collections::{BTreeMap, VecDeque};
@@ -9,25 +8,27 @@ use std::pin::Pin;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::task::{Context, Poll, Waker};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::mpsc::{UnboundedReceiver as Receiver, UnboundedSender as Sender};
 use tokio::sync::oneshot;
 use tokio::time::Sleep;
-use tracing::trace;
+use tracing::{debug, trace};
 
 use crate::constants::{
-    UDX_CLOCK_GRANULARITY_MS, UDX_HEADER_DATA, UDX_HEADER_END, UDX_MAX_DATA_SIZE,
+    UDX_CLOCK_GRANULARITY_MS, UDX_HEADER_DATA, UDX_HEADER_END, UDX_HEADER_SACK, UDX_MAX_DATA_SIZE,
     UDX_MAX_TRANSMITS, UDX_MTU,
 };
 use crate::error::UdxError;
 use crate::mutex::{Mutex, MutexGuard};
-use crate::packet::{Header, IncomingPacket, Packet, PacketRef};
+use crate::packet::{read_u32_le, Header, IncomingPacket, Packet, PacketRef, PacketSet};
 use crate::socket::EventIncoming;
-use crate::udp::{Transmit, UdpState};
+use crate::udp::UdpState;
+use crate::EventOutgoing;
 
 const SSTHRESH: usize = 0xffff;
 const MAX_SEGMENTS: usize = 10;
+// const MAX_SEGMENTS: usize = 1;
 
 #[derive(Debug, Default, Clone)]
 pub struct StreamStats {
@@ -59,20 +60,23 @@ impl Future for StreamDriver {
             stream.drive_waker = None;
         }
 
-        let should_continue = stream.poll_drive(cx);
-
         if stream.closed_and_drained() {
             if let Some(tx) = stream.on_close.take() {
                 tx.send(()).ok();
             }
+            let _ = stream
+                .send_tx
+                .send(EventOutgoing::StreamDropped(stream.local_id));
             return Poll::Ready(());
         }
+
+        let should_continue = stream.poll_drive(cx);
 
         let should_continue = match should_continue {
             Ok(should_continue) => should_continue,
             Err(err) => {
                 stream.terminate(err);
-                false
+                true
             }
         };
         if should_continue {
@@ -89,17 +93,17 @@ impl Future for StreamDriver {
 impl UdxStream {
     pub(crate) fn connect(
         recv_rx: Receiver<EventIncoming>,
-        send_tx: Sender<Transmit>,
+        send_tx: Sender<EventOutgoing>,
         udp_state: Arc<UdpState>,
         dest: SocketAddr,
-        // _local_id: u32,
         remote_id: u32,
+        local_id: u32,
     ) -> Self {
         let rto = Duration::from_millis(1000);
         let stream = UdxStreamInner {
             recv_rx,
             remote_id,
-            // local_id,
+            local_id,
             seq: 0,
             ack: 0,
             inflight: 0,
@@ -185,7 +189,7 @@ impl AsyncWrite for UdxStream {
 
 #[derive(Debug)]
 pub(crate) struct UdxStreamInner {
-    send_tx: Sender<Transmit>,
+    send_tx: Sender<EventOutgoing>,
     recv_rx: Receiver<EventIncoming>,
 
     incoming: BTreeMap<u32, IncomingPacket>,
@@ -193,6 +197,7 @@ pub(crate) struct UdxStreamInner {
     send_queue: VecDeque<PacketRef>,
 
     remote_id: u32,
+    local_id: u32,
     remote_addr: SocketAddr,
 
     seq: u32,
@@ -221,6 +226,22 @@ pub(crate) struct UdxStreamInner {
     udp_state: Arc<UdpState>,
 }
 
+// enum CloseReason {
+//     Manual,
+//     Dropped,
+// }
+
+impl Drop for UdxStream {
+    fn drop(&mut self) {
+        // Only the driver is left, shutdown.
+        if Arc::strong_count(&self.0) <= 2 {
+            self.0
+                .lock("UdxStream::drop")
+                .terminate(UdxError::close_graceful());
+        }
+    }
+}
+
 impl UdxStreamInner {
     fn create_header(&self, mut typ: u32) -> Header {
         if matches!(self.state, StreamState::LocalClosed) {
@@ -242,6 +263,8 @@ impl UdxStreamInner {
         Packet::new(dest, header, body)
     }
 
+    // fn close(&mut self, reason: CloseReason) {}
+
     fn terminate(&mut self, error: impl Into<UdxError>) {
         self.error = Some(error.into());
         self.state = StreamState::LocalClosed;
@@ -261,8 +284,9 @@ impl UdxStreamInner {
     }
 
     fn poll_drive(&mut self, cx: &mut Context<'_>) -> io::Result<bool> {
-        self.poll_check_timeouts(cx)?;
         self.poll_incoming(cx)?;
+        self.poll_check_timeouts(cx)?;
+        self.flush_waiting_packets();
         self.poll_transmit(cx);
         Ok(false)
     }
@@ -287,71 +311,113 @@ impl UdxStreamInner {
             .unwrap();
         self.rto_timeout.as_mut().reset(next);
         // shrink the window
+        let old_cwnd = self.cwnd;
         self.cwnd = UDX_MTU.max(self.cwnd / 2);
-        // queue retransmits.
+        debug!(
+            lid = self.local_id,
+            rid = self.remote_id,
+            "shrink cwnd from {} to {}, @seq {} @remote_acked {} @inflight {} @sql {}",
+            old_cwnd,
+            self.cwnd,
+            self.seq,
+            self.remote_acked,
+            self.inflight,
+            self.send_queue.len()
+        );
+        // Consider all packet losts - seems to be the simple consensus across different stream impls
+        // which we like cause it is nice and simple to implement.
         for i in self.remote_acked..self.seq {
             if let Some(packet) = self.outgoing.get(&i) {
+                if packet.waiting.load(Ordering::SeqCst) {
+                    continue;
+                }
                 let may_retransmit = packet.transmits.fetch_update(
                     Ordering::SeqCst,
                     Ordering::SeqCst,
                     |transmits| {
-                        if transmits >= UDX_MAX_TRANSMITS as usize {
+                        if transmits > UDX_MAX_TRANSMITS as usize {
                             None
                         } else {
                             Some(transmits + 1)
                         }
                     },
                 );
-                match may_retransmit {
-                    Ok(_) => {
-                        trace!("queue retransmit {}", packet.header.seq);
-                        self.send_queue.push_back(PacketRef::Shared(packet.clone()));
-                    }
-                    Err(_) => {
-                        return Err(io::Error::new(
-                            io::ErrorKind::TimedOut,
-                            "Max retransmits reached without ack",
-                        ));
-                    }
+                if may_retransmit.is_err() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "Max retransmits reached without ack",
+                    ));
                 }
+                packet.waiting.store(true, Ordering::SeqCst);
+                self.inflight -= packet.len();
             }
         }
+
+        // self.flush_waiting_packets();
         Ok(())
+    }
+
+    // pub fn really_send_data_packet(&mut self, packet: PacketRef) -> bool {
+    //     packet.waiting.store(false, Ordering::SeqCst);
+    //     self.inflight += packet.len();
+    //     self.send_queue.push_back(packet);
+    //     true
+    // }
+
+    pub fn flush_waiting_packets(&mut self) {
+        // queue retransmits and waiting packets.
+        let mut queued_retransmits = 0;
+        for i in self.remote_acked..self.seq {
+            if let Some(packet) = self.outgoing.get(&i) {
+                if !packet.waiting.load(Ordering::SeqCst) {
+                    continue;
+                }
+                if self.inflight + packet.len() > self.cwnd {
+                    break;
+                }
+                queued_retransmits += 1;
+                packet.waiting.store(false, Ordering::SeqCst);
+                self.inflight += packet.len();
+                self.send_queue.push_back(PacketRef::Shared(packet.clone()));
+            }
+        }
+        if queued_retransmits > 0 {
+            debug!(
+                lid = self.local_id,
+                rid = self.remote_id,
+                "queue retransmits {} ({} to {}) rto {:?} cwnd {} inflight {} sql {}",
+                queued_retransmits,
+                self.remote_acked,
+                self.seq,
+                self.rto,
+                self.cwnd,
+                self.inflight,
+                self.send_queue.len()
+            );
+        }
     }
 
     fn poll_transmit(&mut self, _cx: &mut Context<'_>) {
         let max_segments = self.udp_state.max_gso_segments().min(MAX_SEGMENTS);
-        // eprintln!("poll_transmit send_queue {:#?}", self.send_queue);
-        // let mut num_datagrams = 0;
-        let mut transmits = VecDeque::new();
-        let mut queue = VecDeque::new();
         let mut segment_size = 0;
+        let mut queue = Vec::new();
         while let Some(packet) = self.send_queue.pop_front() {
-            if packet.buf.len() != segment_size {
-                queue_transmits(
-                    &mut transmits,
-                    &mut queue,
-                    segment_size,
-                    max_segments,
-                    self.remote_addr,
-                );
+            if packet.buf.len() != segment_size || queue.len() == max_segments {
+                if !queue.is_empty() {
+                    let set = PacketSet::new(self.remote_addr, queue, segment_size);
+                    queue = Vec::new();
+                    if let Err(_err) = self.send_tx.send(EventOutgoing::Transmit(set)) {
+                        unimplemented!();
+                    }
+                }
+                segment_size = packet.buf.len();
             }
-            segment_size = packet.buf.len();
-            queue.push_back(packet);
+            queue.push(packet);
         }
-        queue_transmits(
-            &mut transmits,
-            &mut queue,
-            segment_size,
-            max_segments,
-            self.remote_addr,
-        );
-        // eprintln!("poll_transmit transmits {:#?}", transmits);
-
-        while let Some(transmit) = transmits.pop_front() {
-            match self.send_tx.send(transmit) {
-                Ok(()) => {}
-                Err(_packet) => unimplemented!(),
+        if !queue.is_empty() {
+            let set = PacketSet::new(self.remote_addr, queue, segment_size);
+            if let Err(_err) = self.send_tx.send(EventOutgoing::Transmit(set)) {
+                unimplemented!();
             }
         }
     }
@@ -372,48 +438,78 @@ impl UdxStreamInner {
                     EventIncoming::Packet(packet) => {
                         remote_ack = remote_ack.max(packet.ack());
                         self.handle_incoming(packet);
+                        // self.send_acks();
                     }
                 },
             }
         }
-        self.send_acks();
-        self.handle_remote_ack(remote_ack);
+        self.handle_incoming_max_remote_ack(remote_ack);
         Ok(())
     }
 
-    fn send_acks(&mut self) {
-        while self.incoming.contains_key(&self.ack) {
-            self.ack += 1;
-            self.send_state_packet();
-        }
-    }
+    // fn send_acks(&mut self) {
+    //     let prev = self.ack;
+    //     // trace!(
+    //     //     lid = self.local_id,
+    //     //     rid = self.remote_id,
+    //     //     "START QUEUE ACKS @ {}",
+    //     //     self.ack
+    //     // );
 
-    fn handle_remote_ack(&mut self, ack: u32) {
+    //     while self.incoming.contains_key(&self.ack) {
+    //         self.ack += 1;
+    //         self.send_state_packet();
+    //     }
+    //     if prev < self.ack {
+    //         trace!(
+    //             lid = self.local_id,
+    //             rid = self.remote_id,
+    //             "send acks from {} to {}",
+    //             prev,
+    //             self.ack
+    //         );
+    //     }
+    // }
+
+    fn handle_incoming_max_remote_ack(&mut self, ack: u32) {
         if ack <= self.remote_acked {
             return;
         }
 
         while self.remote_acked < ack {
-            // TODO: Clear from send queue.
             self.remote_acked += 1;
             let packet = self.outgoing.remove(&(self.remote_acked - 1));
+
             if let Some(packet) = packet {
-                self.handle_ack(&packet);
+                self.handle_remote_ack_for_packet(&packet);
             } else {
                 // Received invalid ack (too high)
                 tracing::error!("received invalid ack (too high)");
             }
         }
+
+        if (self.inflight + UDX_MTU) <= self.cwnd {
+            if let Some(waker) = self.write_waker.take() {
+                waker.wake();
+            }
+        }
+
+        self.rto_timeout
+            .as_mut()
+            .reset(tokio::time::Instant::now().checked_add(self.rto).unwrap());
     }
 
-    fn handle_ack(&mut self, packet: &Packet) {
-        self.inflight -= packet.buf.len();
+    fn handle_remote_ack_for_packet(&mut self, packet: &Packet) {
+        if !packet.waiting.load(Ordering::SeqCst) {
+            self.inflight -= packet.buf.len();
+        }
         self.stats.inflight_bytes -= packet.data_len();
         self.stats.inflight_packets -= 1;
 
         // recalculate timings
-        let rtt = Instant::now() - packet.time_sent;
-        if packet.transmits.load(Ordering::SeqCst) == 1 {
+        if !packet.time_sent.is_empty() && packet.transmits.load(Ordering::SeqCst) == 1 {
+            let rtt = packet.time_sent.elapsed();
+            // First round trip time sample
             if self.srtt.is_zero() {
                 self.srtt = rtt;
                 self.rttvar = rtt / 2;
@@ -434,28 +530,48 @@ impl UdxStreamInner {
                 .max(self.srtt + UDX_CLOCK_GRANULARITY_MS.max(4 * self.rttvar));
         }
 
-        self.rto_timeout
-            .as_mut()
-            .reset(tokio::time::Instant::now().checked_add(self.rto).unwrap());
+        // If this packet was queued for sending we need to remove it from the queue.
+        packet.skip.store(true, Ordering::SeqCst);
+    }
 
-        if (self.inflight + UDX_MTU) <= self.cwnd {
-            if let Some(waker) = self.write_waker.take() {
-                waker.wake();
+    fn handle_incoming_sacks(&mut self, packet: &IncomingPacket) {
+        // TODO
+        // let mut n = 0;
+        let mut i = 0;
+        let buf = &packet.buf[..];
+        while i + 8 < buf.len() {
+            let start = read_u32_le(&buf[i..(i + 4)]);
+            i += 4;
+            let end = read_u32_le(&buf[i..(i + 4)]);
+            i += 4;
+            for i in start..end {
+                let packet = self.outgoing.remove(&i);
+                if let Some(packet) = packet {
+                    self.handle_remote_ack_for_packet(&packet);
+                }
             }
         }
     }
 
     fn handle_incoming(&mut self, packet: IncomingPacket) {
+        trace!(
+            lid = self.local_id,
+            rid = self.remote_id,
+            seq = self.seq,
+            ack = self.ack,
+            rack = self.remote_acked,
+            "handle incoming typ {} seq {} ack {}",
+            packet.header.typ,
+            packet.header.seq,
+            packet.header.ack
+        );
         self.stats.rx_packets += 1;
-        // congestion control..
-        if packet.ack() != self.remote_acked {
-            if self.cwnd < SSTHRESH {
-                self.cwnd += UDX_MTU;
-            } else {
-                self.cwnd += ((UDX_MTU * UDX_MTU) / self.cwnd).max(1);
-            }
+
+        if packet.has_type(UDX_HEADER_SACK) {
+            self.handle_incoming_sacks(&packet);
         }
 
+        let header = packet.header.clone();
         if packet.has_type(UDX_HEADER_END) {
             self.state = StreamState::RemoteClosed;
             self.terminate(UdxError::closed_by_remote());
@@ -472,6 +588,22 @@ impl UdxStreamInner {
                 if let Some(waker) = self.read_waker.take() {
                     waker.wake();
                 }
+            }
+            while self.incoming.contains_key(&self.ack) {
+                self.ack += 1;
+            }
+            self.send_state_packet();
+        }
+
+        // congestion control..
+        if header.ack > self.seq {
+            return;
+        }
+        if header.ack != self.remote_acked {
+            if self.cwnd < SSTHRESH {
+                self.cwnd += UDX_MTU;
+            } else {
+                self.cwnd += ((UDX_MTU * UDX_MTU) / self.cwnd).max(1);
             }
         }
     }
@@ -501,7 +633,11 @@ impl UdxStreamInner {
     }
 
     fn send_state_packet(&mut self) {
-        let packet = self.create_packet(0, &[]);
+        let mut typ = 0;
+        if let Some(_error) = &self.error {
+            typ = typ | UDX_HEADER_END;
+        }
+        let packet = self.create_packet(typ, &[]);
         self.send_queue.push_back(PacketRef::Owned(packet));
         self.wake_driver();
         self.stats.tx_packets += 1;
@@ -515,7 +651,6 @@ impl UdxStreamInner {
         let packet = self.create_packet(UDX_HEADER_DATA, &buf[..len]);
         let packet = Arc::new(packet);
 
-        self.inflight += packet.buf.len();
         self.seq += 1;
 
         self.stats.inflight_bytes += packet.data_len();
@@ -524,7 +659,12 @@ impl UdxStreamInner {
         self.stats.inflight_packets += 1;
 
         self.outgoing.insert(packet.seq(), Arc::clone(&packet));
+        // if self.send_queue.is_empty() {
+        self.inflight += packet.buf.len();
         self.send_queue.push_back(PacketRef::Shared(packet));
+        // } else {
+        //     packet.waiting.store(true, Ordering::SeqCst);
+        // }
         self.wake_driver();
         len
     }
@@ -604,34 +744,5 @@ impl Debug for UdxStream {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let inner = self.0.lock("UdxStream::debug");
         write!(f, "{:#?}", &*inner)
-    }
-}
-
-fn queue_transmits(
-    transmits: &mut VecDeque<Transmit>,
-    queue: &mut VecDeque<PacketRef>,
-    segment_size: usize,
-    max_segments: usize,
-    destination: SocketAddr,
-) {
-    while !queue.is_empty() {
-        let segments = queue.len().min(max_segments);
-        let size = segments * segment_size;
-        let mut buf = Vec::with_capacity(size);
-        for _ in 0..segments {
-            let packet = queue.pop_front().unwrap();
-            buf.put_slice(packet.buf.as_slice());
-        }
-        let transmit = Transmit {
-            destination,
-            ecn: None,
-            src_ip: None,
-            contents: buf,
-            segment_size: match segments {
-                1 => None,
-                _ => Some(segment_size),
-            },
-        };
-        transmits.push_back(transmit);
     }
 }

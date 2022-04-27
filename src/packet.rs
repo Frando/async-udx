@@ -1,8 +1,8 @@
+use atomic_instant::AtomicInstant;
 use bytes::{BufMut, Bytes};
-use std::collections::VecDeque;
 use std::fmt::{self, Debug};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Instant;
 use std::{io, net::SocketAddr, sync::atomic::AtomicUsize};
 use udx_udp::Transmit;
 
@@ -15,63 +15,103 @@ pub(crate) enum PacketRef {
 }
 
 // invariant: all packets need to have the same size if segment_size is set!!
+// invariant: may not be larger than max_segments as reported from usp_state
 pub struct PacketSet {
     dest: SocketAddr,
     segment_size: Option<usize>,
-    packets: Vec<PacketRef>,
+    pub(crate) packets: Vec<PacketRef>,
 }
 
-impl PacketSet {
-    fn into_transmits(&self, max_segments: usize) -> VecDeque<Transmit> {
-        match self.segment_size {
-            None => self
-                .packets
-                .iter()
-                .map(|packet| packet.to_transmit())
-                .collect(),
-            Some(segment_size) => {
-                let mut transmits = VecDeque::new();
-                queue_transmits(
-                    &mut transmits,
-                    &self.packets,
-                    segment_size,
-                    max_segments,
-                    self.dest,
-                );
-                transmits
-            }
-        }
+impl fmt::Debug for PacketSet {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let packet_debug = self
+            .packets
+            .iter()
+            .map(|p| {
+                format!(
+                    "i:{} t:{} s:{} a:{} l:{}",
+                    p.header.stream_id,
+                    p.header.typ,
+                    p.header.seq,
+                    p.header.ack,
+                    p.data_len()
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        f.debug_struct("PacketSet")
+            .field("dest", &self.dest)
+            .field("packet_count", &self.packets.len())
+            .field("packets", &packet_debug)
+            .field("segment_size", &self.segment_size)
+            .finish()
     }
 }
 
-fn queue_transmits(
-    transmits: &mut VecDeque<Transmit>,
-    packets: &[PacketRef],
-    segment_size: usize,
-    max_segments: usize,
-    destination: SocketAddr,
-) {
-    let mut i = 0;
-    while i < packets.len() {
-        let segments = (packets.len() - i).min(max_segments);
-        let size = segments * segment_size;
-        let mut buf = Vec::with_capacity(size);
-        for j in 0..segments {
-            let packet = packets.get(i + j).unwrap();
-            buf.put_slice(packet.buf.as_slice());
+impl PacketSet {
+    pub(crate) fn new(dest: SocketAddr, packets: Vec<PacketRef>, segment_size: usize) -> Self {
+        Self {
+            dest,
+            packets,
+            segment_size: Some(segment_size),
         }
-        let transmit = Transmit {
-            destination,
-            ecn: None,
-            src_ip: None,
-            contents: buf,
-            segment_size: match segments {
-                1 => None,
-                _ => Some(segment_size),
-            },
-        };
-        transmits.push_back(transmit);
-        i += 1;
+    }
+
+    // pub fn new_single(packet: PacketRef) -> Self {
+    //     Self {
+    //         dest: packet.dest,
+    //         packets: vec![packet],
+    //         segment_size: None,
+    //     }
+    // }
+    pub fn to_transmit(&self) -> Transmit {
+        match self.segment_size {
+            None => {
+                assert!(self.packets.len() == 1);
+                self.packets.first().unwrap().to_transmit()
+            }
+            Some(segment_size) => {
+                // assert!(self.packets.len() <= max_segments);
+                // let segments = self.packets.len().min(max_segments);
+                let segments = self.packets.len();
+                let size = segments * segment_size;
+                let mut buf = Vec::with_capacity(size);
+                for packet in self.packets.iter() {
+                    if !packet.skip.load(Ordering::SeqCst) {
+                        buf.put_slice(packet.buf.as_slice());
+                    }
+                }
+                // for j in 0..segments {
+                //     let packet = self.packets.get(j).unwrap();
+                //     buf.put_slice(packet.buf.as_slice());
+                // }
+                let transmit = Transmit {
+                    destination: self.dest,
+                    ecn: None,
+                    src_ip: None,
+                    contents: buf,
+                    segment_size: match segments {
+                        1 => None,
+                        _ => Some(segment_size),
+                    },
+                };
+                transmit
+                // self
+                // .packets
+                // .iter()
+                // .map(|packet| packet.to_transmit())
+                // .collect(),
+                // let mut transmits = VecDeque::new();
+                // queue_transmits(
+                //     &mut transmits,
+                //     &self.packets,
+                //     segment_size,
+                //     max_segments,
+                //     self.dest,
+                // );
+                // transmits
+            }
+        }
     }
 }
 
@@ -115,7 +155,9 @@ impl PacketBuf {
 }
 
 pub(crate) struct Packet {
-    pub time_sent: Instant,
+    pub waiting: AtomicBool,
+    pub skip: AtomicBool,
+    pub time_sent: AtomicInstant,
     pub transmits: AtomicUsize,
     pub dest: SocketAddr,
     pub header: Header,
@@ -125,6 +167,7 @@ pub(crate) struct Packet {
 impl fmt::Debug for Packet {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Packet")
+            .field("skip", &self.skip)
             .field("transmits", &self.transmits)
             .field("dest", &self.dest)
             .field("header", &self.header)
@@ -158,7 +201,9 @@ impl Packet {
             buf.as_mut_slice()[UDX_HEADER_SIZE..].copy_from_slice(body);
         }
         Self {
-            time_sent: Instant::now(),
+            skip: AtomicBool::new(false),
+            waiting: AtomicBool::new(false),
+            time_sent: AtomicInstant::empty(),
             transmits: AtomicUsize::new(0),
             dest,
             header,
@@ -168,6 +213,10 @@ impl Packet {
 
     pub fn seq(&self) -> u32 {
         self.header.seq
+    }
+
+    pub fn len(&self) -> usize {
+        self.buf.len()
     }
 
     pub fn data_len(&self) -> usize {
@@ -275,6 +324,6 @@ impl Header {
     }
 }
 
-fn read_u32_le(buf: &[u8]) -> u32 {
+pub fn read_u32_le(buf: &[u8]) -> u32 {
     u32::from_le_bytes(buf.try_into().unwrap())
 }
