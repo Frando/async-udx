@@ -22,12 +22,13 @@ use tracing::{debug, trace};
 use crate::constants::UDX_HEADER_SIZE;
 use crate::constants::UDX_MTU;
 use crate::mutex::Mutex;
-use crate::packet::PacketSet;
-use crate::packet::{Header, IncomingPacket};
+use crate::packet::{Dgram, Header, IncomingPacket, PacketSet};
 use crate::stream::UdxStream;
 use crate::udp::{RecvMeta, Transmit, UdpSocket, UdpState, BATCH_SIZE};
 
 const MAX_LOOP: usize = 60;
+
+const RECV_QUEUE_MAX_LEN: usize = 1024;
 
 #[derive(Debug)]
 pub(crate) enum EventIncoming {
@@ -37,6 +38,7 @@ pub(crate) enum EventIncoming {
 #[derive(Debug)]
 pub(crate) enum EventOutgoing {
     Transmit(PacketSet),
+    TransmitDgram(Dgram),
     // TransmitOne(PacketRef),
     StreamDropped(u32),
 }
@@ -86,6 +88,30 @@ impl UdxSocket {
 
     pub fn stats(&self) -> SocketStats {
         self.0.lock("UdxSocket::stats").stats.clone()
+    }
+
+    pub fn send(&self, dest: SocketAddr, buf: &[u8]) {
+        let dgram = Dgram::new(dest, buf.to_vec().into());
+        let ev = EventOutgoing::TransmitDgram(dgram);
+        self.0.lock("UdxSocket::send").send_tx.send(ev).unwrap();
+    }
+
+    pub fn recv(&self) -> RecvFuture {
+        RecvFuture(self.clone())
+    }
+}
+
+pub struct RecvFuture(UdxSocket);
+impl Future for RecvFuture {
+    type Output = io::Result<(SocketAddr, Vec<u8>)>;
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let mut socket = self.0.lock("UdxSocket::recv");
+        if let Some(dgram) = socket.recv_dgrams.pop_front() {
+            Poll::Ready(Ok((dgram.dest, dgram.buf)))
+        } else {
+            socket.recv_waker = Some(cx.waker().clone());
+            Poll::Pending
+        }
     }
 }
 
@@ -141,8 +167,8 @@ pub struct UdxSocketInner {
     send_rx: Receiver<EventOutgoing>,
     send_tx: Sender<EventOutgoing>,
     streams: HashMap<u32, StreamHandle>,
-    pending_transmits: VecDeque<Transmit>,
-    pending_transmits_packets: VecDeque<PacketSet>,
+    outgoing_transmits: VecDeque<Transmit>,
+    outgoing_packet_sets: VecDeque<PacketSet>,
     recv_buf: Box<[u8]>,
     udp_state: Arc<UdpState>,
     stats: SocketStats,
@@ -150,6 +176,8 @@ pub struct UdxSocketInner {
     drive_waker: Option<Waker>,
 
     send_overflow_timer: Option<Pin<Box<Sleep>>>,
+    recv_dgrams: VecDeque<Dgram>,
+    recv_waker: Option<Waker>,
 }
 
 impl fmt::Debug for UdxSocketInner {
@@ -157,7 +185,7 @@ impl fmt::Debug for UdxSocketInner {
         f.debug_struct("UdxSocketInner")
             .field("socket", &self.socket)
             .field("streams", &self.streams)
-            .field("pending_transmits", &self.pending_transmits.len())
+            .field("pending_transmits", &self.outgoing_transmits.len())
             .field("udp_state", &self.udp_state)
             .field("stats", &self.stats)
             .field("has_refs", &self.has_refs)
@@ -220,12 +248,14 @@ impl UdxSocketInner {
             streams: HashMap::new(),
             recv_buf: recv_buf.into(),
             udp_state: Arc::new(UdpState::new()),
-            pending_transmits: VecDeque::with_capacity(BATCH_SIZE),
-            pending_transmits_packets: VecDeque::with_capacity(BATCH_SIZE),
+            outgoing_transmits: VecDeque::with_capacity(BATCH_SIZE),
+            outgoing_packet_sets: VecDeque::with_capacity(BATCH_SIZE),
             stats: SocketStats::default(),
             has_refs: true,
             drive_waker: None,
             send_overflow_timer: None,
+            recv_waker: None,
+            recv_dgrams: VecDeque::new(),
         })
     }
 
@@ -261,12 +291,11 @@ impl UdxSocketInner {
     }
 
     fn poll_transmit(&mut self, cx: &mut Context<'_>) -> io::Result<bool> {
-        // let local_addr = self.local_addr().unwrap();
         let mut iters = 0;
         loop {
             iters += 1;
             let mut send_rx_pending = false;
-            while self.pending_transmits.len() < BATCH_SIZE {
+            while self.outgoing_transmits.len() < BATCH_SIZE {
                 match Pin::new(&mut self.send_rx).poll_recv(cx) {
                     Poll::Pending => {
                         send_rx_pending = true;
@@ -277,24 +306,25 @@ impl UdxSocketInner {
                         EventOutgoing::StreamDropped(local_id) => {
                             let _ = self.streams.remove(&local_id);
                         }
+                        EventOutgoing::TransmitDgram(dgram) => {
+                            self.outgoing_transmits.push_back(dgram.into_transmit());
+                        }
                         EventOutgoing::Transmit(packet_set) => {
                             let transmit = packet_set.to_transmit();
-                            self.stats.track_tx(&transmit);
                             trace!("send {:?}", packet_set);
-                            // trace!("send {:?}", transmit);
-                            self.pending_transmits.push_back(transmit);
-                            self.pending_transmits_packets.push_back(packet_set);
+                            self.outgoing_transmits.push_back(transmit);
+                            self.outgoing_packet_sets.push_back(packet_set);
                         }
                     },
                 }
             }
-            if self.pending_transmits.is_empty() {
+            if self.outgoing_transmits.is_empty() {
                 break Ok(false);
             }
 
             match self
                 .socket
-                .poll_send(&self.udp_state, cx, self.pending_transmits.as_slices().0)
+                .poll_send(&self.udp_state, cx, self.outgoing_transmits.as_slices().0)
             {
                 Poll::Pending => break Ok(false),
                 Poll::Ready(Err(err)) if err.kind() == io::ErrorKind::Interrupted => {
@@ -306,9 +336,13 @@ impl UdxSocketInner {
                 }
                 Poll::Ready(Err(err)) => break Err(err),
                 Poll::Ready(Ok(n)) => {
-                    self.pending_transmits.drain(..n);
-                    for packet_set in self.pending_transmits_packets.drain(..n) {
-                        for packet in packet_set.packets {
+                    for transmit in self.outgoing_transmits.drain(..n) {
+                        self.stats.track_tx(&transmit);
+                    }
+                    // update packet sent time for data packets.
+                    let n = n.min(self.outgoing_packet_sets.len());
+                    for packet_set in self.outgoing_packet_sets.drain(..n) {
+                        for packet in packet_set.iter_shared() {
                             packet.time_sent.set_now();
                         }
                     }
@@ -357,6 +391,15 @@ impl UdxSocketInner {
                                 // received invalid header.
                                 // treat as received message.
                                 // push to recv_message queue.
+                                if self.recv_dgrams.len() < RECV_QUEUE_MAX_LEN {
+                                    self.recv_dgrams
+                                        .push_back(Dgram::new(meta.addr, data.to_vec()));
+                                    if let Some(waker) = self.recv_waker.take() {
+                                        waker.wake()
+                                    }
+                                } else {
+                                    drop(data)
+                                }
                             }
                             Ok(header) => {
                                 trace!(

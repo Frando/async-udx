@@ -719,11 +719,11 @@ impl AsyncRead for UdxStreamInner {
         //     self.ack,
         //     self.incoming.len()
         // );
-        if let Some(error) = &self.error {
-            return Poll::Ready(Err(error.clone().into()));
-        }
         let did_read = self.read_next(buf)?;
         let res = if !did_read {
+            if let Some(error) = &self.error {
+                return Poll::Ready(Err(error.clone().into()));
+            }
             self.read_waker = Some(cx.waker().clone());
             Poll::Pending
         } else {

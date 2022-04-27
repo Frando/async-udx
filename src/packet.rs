@@ -9,6 +9,27 @@ use udx_udp::Transmit;
 use crate::constants::{UDX_HEADER_SIZE, UDX_MAGIC_BYTE, UDX_VERSION};
 
 #[derive(Debug)]
+pub struct Dgram {
+    pub buf: Vec<u8>,
+    pub dest: SocketAddr,
+}
+
+impl Dgram {
+    pub fn new(dest: SocketAddr, buf: Vec<u8>) -> Self {
+        Self { dest, buf }
+    }
+    pub fn into_transmit(self) -> Transmit {
+        Transmit {
+            segment_size: None,
+            destination: self.dest,
+            ecn: None,
+            src_ip: None,
+            contents: self.buf.into(),
+        }
+    }
+}
+
+#[derive(Debug)]
 pub(crate) enum PacketRef {
     Owned(Packet),
     Shared(Arc<Packet>),
@@ -55,6 +76,13 @@ impl PacketSet {
             packets,
             segment_size: Some(segment_size),
         }
+    }
+
+    pub fn iter_shared(&self) -> impl IntoIterator<Item = &Packet> {
+        self.packets.iter().filter_map(|packet| match packet {
+            PacketRef::Shared(packet) => Some(packet.as_ref()),
+            _ => None,
+        })
     }
 
     // pub fn new_single(packet: PacketRef) -> Self {
@@ -154,7 +182,7 @@ impl PacketBuf {
     }
 }
 
-pub(crate) struct Packet {
+pub struct Packet {
     pub waiting: AtomicBool,
     pub skip: AtomicBool,
     pub time_sent: AtomicInstant,

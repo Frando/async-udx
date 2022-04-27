@@ -37,26 +37,44 @@ async fn stream_close() -> io::Result<()> {
     // write a message.
     let msg = vec![1, 2, 3];
     streama.write_all(&msg).await?;
-    assert_eq!(streama.stats().inflight_packets, 1);
+    assert_eq!(streama.stats().inflight_packets, 1, "inflight 1 after send");
 
     // close the stream
     let close = streama.close();
-    assert_eq!(streama.stats().inflight_packets, 1);
+    assert_eq!(
+        streama.stats().inflight_packets,
+        1,
+        "inflight still 1 after send"
+    );
 
     // wait until closing is complete == all packages flushed
     close.await;
-    assert_eq!(streama.stats().inflight_packets, 0);
+    assert_eq!(
+        streama.stats().inflight_packets,
+        0,
+        "inflight 0 after close await"
+    );
 
     // ensure reading on other end still works
     let mut read = vec![0u8; 3];
-    streamb.read_exact(&mut read).await?;
-    assert_eq!(msg, read);
+    let res = streamb.read_exact(&mut read).await;
+    let res = res?;
+    assert_eq!(msg, read, "read ok");
 
     // try to write on closed stream
     let res = streama.write_all(&msg).await;
-    assert_eq!(res.err().unwrap().kind(), io::ErrorKind::ConnectionReset);
-
-    eprintln!("streamb {:#?}", streamb);
+    assert_eq!(
+        res.err().unwrap().kind(),
+        io::ErrorKind::ConnectionReset,
+        "stream closed"
+    );
+    // try to read on closed stream
+    let res = streama.read(&mut read).await;
+    assert_eq!(
+        res.err().unwrap().kind(),
+        io::ErrorKind::ConnectionReset,
+        "stream closed"
+    );
 
     Ok(())
 }
