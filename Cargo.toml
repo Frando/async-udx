@@ -36,4 +36,4 @@ default = []
 lock_tracking = []
 
 [workspace]
-members = ["udx-udp"]
+members = ["udx-udp", "secret-stream"]

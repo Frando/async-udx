@@ -1,6 +1,6 @@
 #![allow(dead_code)]
 
-use std::time::{Duration, Instant};
+use std::time::{Instant};
 use std::{future::Future, io};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::task::JoinHandle;
@@ -23,10 +23,10 @@ where
 #[tokio::main]
 async fn main() -> io::Result<()> {
     tracing_subscriber::fmt::init();
-    let mut socka = UdxSocket::bind("127.0.0.1:20004").await?;
+    let socka = UdxSocket::bind("127.0.0.1:20004").await?;
     let addra = socka.local_addr()?;
     eprintln!("socka {addra}");
-    let mut sockb = UdxSocket::bind("127.0.0.1:20005").await?;
+    let sockb = UdxSocket::bind("127.0.0.1:20005").await?;
     let addrb = sockb.local_addr()?;
     eprintln!("sockb {addrb}");
     let streama = socka.connect(addrb, 1, 1)?;

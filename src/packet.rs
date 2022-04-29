@@ -24,7 +24,7 @@ impl Dgram {
             destination: self.dest,
             ecn: None,
             src_ip: None,
-            contents: self.buf.into(),
+            contents: self.buf,
         }
     }
 }
@@ -113,7 +113,8 @@ impl PacketSet {
                 //     let packet = self.packets.get(j).unwrap();
                 //     buf.put_slice(packet.buf.as_slice());
                 // }
-                let transmit = Transmit {
+                
+                Transmit {
                     destination: self.dest,
                     ecn: None,
                     src_ip: None,
@@ -122,8 +123,7 @@ impl PacketSet {
                         1 => None,
                         _ => Some(segment_size),
                     },
-                };
-                transmit
+                }
                 // self
                 // .packets
                 // .iter()
@@ -147,8 +147,8 @@ impl std::ops::Deref for PacketRef {
     type Target = Packet;
     fn deref(&self) -> &Self::Target {
         match self {
-            PacketRef::Owned(packet) => &packet,
-            PacketRef::Shared(packet) => &packet,
+            PacketRef::Owned(packet) => packet,
+            PacketRef::Shared(packet) => packet,
         }
     }
 }
@@ -248,7 +248,7 @@ impl Packet {
     }
 
     pub fn data_len(&self) -> usize {
-        self.buf.len().checked_sub(UDX_HEADER_SIZE).unwrap_or(0)
+        self.buf.len().saturating_sub(UDX_HEADER_SIZE)
     }
 
     fn to_transmit(&self) -> Transmit {

@@ -78,7 +78,7 @@ async fn main() {
             for _i in 0..iters {
                 reader.read_exact(&mut read_buf).await.unwrap();
             }
-            assert_eq!(&read_buf.as_slice()[..], &[i as u8; MSGSIZE][..]);
+            assert_eq!(read_buf.as_slice(), &[i as u8; MSGSIZE][..]);
             // eprintln!("read! {:?}", read_buf);
             // eprintln!(
             //     "reader stats {:?} remote_addr {}",

@@ -91,7 +91,7 @@ impl UdxSocket {
     }
 
     pub fn send(&self, dest: SocketAddr, buf: &[u8]) {
-        let dgram = Dgram::new(dest, buf.to_vec().into());
+        let dgram = Dgram::new(dest, buf.to_vec());
         let ev = EventOutgoing::TransmitDgram(dgram);
         self.0.lock("UdxSocket::send").send_tx.send(ev).unwrap();
     }
@@ -394,6 +394,7 @@ impl UdxSocketInner {
                                 if self.recv_dgrams.len() < RECV_QUEUE_MAX_LEN {
                                     self.recv_dgrams
                                         .push_back(Dgram::new(meta.addr, data.to_vec()));
+                                    // todo: remove
                                     if let Some(waker) = self.recv_waker.take() {
                                         waker.wake()
                                     }

@@ -140,8 +140,8 @@ impl UdxStream {
         let (tx, rx) = oneshot::channel();
         stream.on_close = Some(tx);
         drop(stream);
-        let rx = rx.map(|_r| ());
-        rx
+        
+        rx.map(|_r| ())
     }
 
     pub fn remote_addr(&self) -> SocketAddr {
@@ -245,7 +245,7 @@ impl Drop for UdxStream {
 impl UdxStreamInner {
     fn create_header(&self, mut typ: u32) -> Header {
         if matches!(self.state, StreamState::LocalClosed) {
-            typ = typ & UDX_HEADER_END;
+            typ &= UDX_HEADER_END;
         }
         Header {
             stream_id: self.remote_id,
@@ -635,7 +635,7 @@ impl UdxStreamInner {
     fn send_state_packet(&mut self) {
         let mut typ = 0;
         if let Some(_error) = &self.error {
-            typ = typ | UDX_HEADER_END;
+            typ |= UDX_HEADER_END;
         }
         let packet = self.create_packet(typ, &[]);
         self.send_queue.push_back(PacketRef::Owned(packet));
