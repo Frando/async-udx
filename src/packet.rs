@@ -1,23 +1,36 @@
+use derivative::Derivative;
 use std::{
+    fmt,
     net::SocketAddr,
     sync::{atomic::AtomicU32, Arc},
-    time::Instant,
 };
 
 use crate::{constants::*, StreamRef, UdxBuf, UdxSocket, UdxStream};
 
+#[derive(Debug)]
+pub enum PacketRef {
+    Packet(Packet),
+    Ref(u32),
+}
+
+#[derive(Derivative, Clone)]
+#[derivative(Debug)]
 pub struct PendingRead {
     pub seq: u32,
     pub r#type: u32,
+    #[derivative(Debug = "ignore")]
     pub buf: Vec<u8>,
 }
 
+#[derive(Debug, Clone)]
 pub enum PacketStatus {
     Waiting,
     Sending,
     Inflight,
 }
 
+#[derive(Derivative, Clone)]
+#[derivative(Debug)]
 pub struct Packet {
     pub(crate) seq: u32,
     pub(crate) status: PacketStatus,
@@ -31,8 +44,11 @@ pub struct Packet {
 
     pub(crate) dest: SocketAddr,
 
+    pub(crate) header: Header,
+
     // pub(crate) header: [u8; UDX_HEADER_SIZE],
     pub(crate) bufs_len: usize,
+    #[derivative(Debug = "ignore")]
     pub(crate) bufs: [UdxBuf; 2],
 
     pub(crate) ctx: PacketContext,
@@ -51,6 +67,8 @@ impl Packet {
         let header_buf = header.to_vec();
         let packet = Packet {
             seq: stream.seq,
+            // TODO: reomve
+            header,
             transmits: 0,
             size: (Header::SIZE + buf.len()) as u16,
             dest: stream.remote_addr.unwrap(), // TODO: No unwrap here.
@@ -67,14 +85,29 @@ impl Packet {
         };
         packet
     }
+
+    pub fn has_status(&self, status: PacketStatus) -> bool {
+        matches!(&self, status)
+    }
 }
 
+#[derive(Clone)]
 pub enum PacketContext {
     None,
     StreamWrite(Arc<PktStreamWrite>),
     StreamSend(Arc<PktStreamSend>),
     // StreamDestroy(PktStream)
-    Send(PktSend),
+    Send(Arc<PktSend>),
+}
+impl fmt::Debug for PacketContext {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::None => write!(f, "PacketContext::None"),
+            Self::StreamWrite(_) => write!(f, "PacketContext::StreamWrite"),
+            Self::StreamSend(_) => write!(f, "PacketContext::StreamSend"),
+            Self::Send(_) => write!(f, "PacketContext::Send"),
+        }
+    }
 }
 
 pub struct PktSend {
@@ -85,9 +118,9 @@ pub struct PktSend {
 
 pub struct PktStreamWrite {
     pub packets: AtomicU32,
-    pub handle: StreamRef,
+    // pub handle: StreamRef,
     pub on_ack: Option<OnAckCallback>,
-    pub data: Vec<u8>,
+    // pub data: Vec<u8>,
 }
 
 pub struct PktStreamSend {
@@ -96,10 +129,11 @@ pub struct PktStreamSend {
     pub on_send: Option<OnStreamSendCallback>,
 }
 
-pub type OnAckCallback = Box<dyn Fn()>;
-pub type OnSendCallback = Box<dyn Fn()>;
-pub type OnStreamSendCallback = Box<dyn Fn()>;
+pub type OnAckCallback = Box<dyn Fn() + Send + Sync + 'static>;
+pub type OnSendCallback = Box<dyn Fn() + Send + Sync + 'static>;
+pub type OnStreamSendCallback = Box<dyn Fn() + Send + Sync + 'static>;
 
+#[derive(Debug, Clone)]
 pub struct Header {
     pub r#type: u32,
     pub data_offset: usize,
@@ -151,8 +185,8 @@ impl Header {
         }
         buf[0] = UDX_MAGIC_BYTE;
         buf[1] = UDX_VERSION;
-        buf[2..3].copy_from_slice(&self.r#type.to_le_bytes());
-        buf[3..4].copy_from_slice(&self.data_offset.to_le_bytes());
+        buf[2..3].copy_from_slice(&(self.r#type as u8).to_le_bytes());
+        buf[3..4].copy_from_slice(&(self.data_offset as u8).to_le_bytes());
         buf[4..8].copy_from_slice(&self.local_id.to_le_bytes());
         buf[8..12].copy_from_slice(&self.recv_win.to_le_bytes());
         buf[12..16].copy_from_slice(&self.seq.to_le_bytes());
@@ -162,7 +196,7 @@ impl Header {
 }
 
 impl Packet {
-    pub fn read(buf: &[u8]) -> Option<Self> {
+    pub fn read(_buf: &[u8]) -> Option<Self> {
         None
     }
 }

@@ -1,12 +1,18 @@
 use std::collections::HashMap;
+use std::fmt;
 use std::io;
-use std::task::{Context, Poll, Waker};
-use std::time::{Duration, Instant};
+use std::task::{Context, Poll};
+
+use std::time::Duration;
 use std::{collections::VecDeque, net::SocketAddr, sync::Arc};
 use tokio::io::ReadBuf;
-use tokio::net::UdpSocket;
+use tokio::net::{ToSocketAddrs, UdpSocket};
+use tokio::task::JoinHandle;
+use tokio::time::Interval;
 
-use crate::packet::{Header, Packet, PacketStatus, PendingRead};
+use crate::get_milliseconds;
+use crate::packet::{Header, Packet, PacketRef, PacketStatus};
+use crate::SendRes;
 use crate::{constants::*, AckRes, UdxStream};
 use crate::{StreamRef, UdxBuf};
 
@@ -17,6 +23,11 @@ pub struct UdxHandle {
 }
 
 pub struct SocketRef(Arc<Mutex<UdxSocket>>);
+impl fmt::Debug for SocketRef {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "SocketRef")
+    }
+}
 
 // pub struct UdpSocket {
 //     watcher: Async<std::net::UdpSocket>,
@@ -27,21 +38,46 @@ impl SocketRef {
         Self(Arc::new(Mutex::new(socket)))
     }
 
+    pub fn drive(&self) -> JoinHandle<io::Result<()>> {
+        let this = self.clone();
+        tokio::task::spawn(async move {
+            loop {
+                let res = futures::future::poll_fn(|cx| {
+                    let res = this.0.lock("sock:outer poll_fn").poll(cx);
+                    res
+                })
+                .await;
+                res?;
+            }
+        })
+    }
+
+    pub fn close(&self) {
+        self.0.lock("sock:close").status |= UDX_SOCKET_CLOSING;
+    }
+
     // fn stable_id(&self) -> usize {
     //     &*self.0 as *const _ as usize
     // }
 
-    pub fn connect(&mut self, local_id: u32) -> io::Result<StreamRef> {
-        let mut socket = self.0.lock("connect");
+    pub fn connect(
+        &self,
+        dest: SocketAddr,
+        local_id: u32,
+        remote_id: u32,
+    ) -> io::Result<StreamRef> {
+        let mut socket = self.0.lock("sock:connect");
         if socket.streams_len() > u16::MAX as usize {
             return Err(io::Error::new(
                 io::ErrorKind::Other,
                 "Too many streams open",
             ));
         }
-        let stream = UdxStream::new(local_id);
+        let mut stream = UdxStream::new(local_id);
+        let local_addr = socket.local_addr().unwrap();
+        stream.connect(self.clone(), local_addr, dest, remote_id)?;
         let stream = StreamRef::new(stream);
-        socket.streams_by_id.insert(local_id, stream.clone());
+        socket.streams.insert(local_id, stream.clone());
         Ok(stream)
     }
 }
@@ -60,35 +96,26 @@ impl std::ops::Deref for SocketRef {
     }
 }
 
+#[derive(Debug)]
 pub struct UdxSocket {
     socket: UdpSocket,
     send_queue: VecDeque<Packet>,
     status: u32,
-    readers: u32,
-    events: u32,
+    // readers: u32,
+    // events: u32,
     ttl: u32,
     pending_closes: u32,
 
-    streams_len: usize,
-    streams_max_len: usize,
-
-    // streams: Vec<Arc<UdxStream>>,
-    streams_by_id: HashMap<u32, StreamRef>,
+    streams: HashMap<u32, StreamRef>,
 
     read_buf: Vec<u8>,
-    write_buf: Vec<u8>, // pub(crate) write_wakers: VecDeque<Waker>,
+    write_buf: Vec<u8>,
+
+    timeout_interval: Interval,
 }
 
 impl UdxSocket {
-    pub fn streams_len(&self) -> usize {
-        self.streams_len
-    }
-
-    pub fn local_addr(&self) -> io::Result<SocketAddr> {
-        self.socket.local_addr()
-    }
-
-    pub async fn bind(addr: SocketAddr) -> Result<Self, io::Error> {
+    pub async fn bind<A: ToSocketAddrs>(addr: A) -> io::Result<Self> {
         let ttl = UDX_DEFAULT_TTL;
         let socket = UdpSocket::bind(addr).await?;
         socket.set_ttl(ttl)?;
@@ -96,120 +123,150 @@ impl UdxSocket {
             socket,
             send_queue: VecDeque::with_capacity(16),
             status: 0 | UDX_SOCKET_BOUND,
-            readers: 0,
-            events: 0,
             pending_closes: 0,
             ttl,
-            streams_len: 0,
-            streams_max_len: 16,
-            // streams: Vec::with_capacity(16),
-            streams_by_id: HashMap::new(),
+            streams: HashMap::new(),
 
             read_buf: vec![0u8; 2048],
             write_buf: vec![0u8; 2048],
+
+            timeout_interval: tokio::time::interval(Duration::from_millis(
+                UDX_CLOCK_GRANULARITY_MS as u64,
+            )),
         })
     }
 
-    fn poll(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        // Read from the socket.
-        let mut buf = ReadBuf::new(&mut self.read_buf);
-        let incoming = match self.socket.poll_recv_from(cx, &mut buf) {
-            Poll::Pending => None,
-            Poll::Ready(Ok(peer)) => Some((buf.filled().len(), peer)),
-            Poll::Ready(Err(err)) => None,
-        };
-        if let Some((n, peer)) = incoming {
-            match self.process_incoming(n) {
-                Ok(ProcessRes::Handled) => {}
-                Ok(ProcessRes::NotHandled) => {
-                    self.on_unhandled_packet(&self.read_buf[..n])?;
-                }
-                Err(_err) => {}
-            }
-        }
-
-        // Write packets out.
-        while let Some(mut packet) = self.send_queue.get_mut(0) {
-            assert!(matches!(packet.status, PacketStatus::Sending));
-            // TODO: This should update the status within stream.outgoing, not here.
-            packet.status = PacketStatus::Inflight;
-            packet.transmits += 1;
-
-            self.write_buf[0..].copy_from_slice(&packet.bufs[0]);
-            self.write_buf[packet.bufs[0].len()..].copy_from_slice(&packet.bufs[1]);
-            let len = packet.bufs[0].len() + packet.bufs[1].len();
-
-            match self
-                .socket
-                .poll_send_to(cx, &self.write_buf[..len], packet.dest)
-            {
-                Poll::Pending => break,
-                Poll::Ready(Ok(n)) => {
-                    if n < len {
-                        break;
-                    }
-                }
-                Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
-            };
-            // self.socket
-            //     .send_to(&self.write_buf[0..len], packet.dest)
-            //     .await?;
-
-            let _ = self.send_queue.pop_front();
-        }
-
-        Poll::Pending
+    pub fn streams_len(&self) -> usize {
+        self.streams.len()
     }
 
-    // async fn drive(&mut self) -> io::Result<()> {
-    //     tokio::select! {
-    //         res = self.recv_and_process().await => {
-    //             res?;
-    //         }
-    //         res = self.send_queue().await => {
-    //             res?;
-    //         }
-    //     }
-    // }
+    pub fn local_addr(&self) -> io::Result<SocketAddr> {
+        self.socket.local_addr()
+    }
 
-    // async fn recv_and_process(&mut self) -> io::Result<()> {
-    //     let (bytes, peer) = self.socket.recv_from(&mut self.read_buf).await?;
-    //     match self.process_incoming(bytes)? {
-    //         ProcessRes::Handled => {}
-    //         ProcessRes::NotHandled => {
-    //             self.on_unhandled_packet(&self.read_buf[..bytes])?;
-    //         }
+    fn try_poll_send_packet(&self, cx: &mut Context<'_>, packet: &Packet) -> io::Result<SendRes> {
+        let buf0 = &packet.bufs[0];
+        let buf1 = &packet.bufs[1];
+        let len = buf0.len() + buf1.len();
+        // TODO: Don't memcpy when retrying the same packet.
+        // self.write_buf[0..buf0.len()].copy_from_slice(&buf0);
+        // self.write_buf[buf0.len()..len].copy_from_slice(&buf1);
+        let mut write_buf = [0u8; 2048];
+        write_buf[0..buf0.len()].copy_from_slice(&buf0);
+        write_buf[buf0.len()..len].copy_from_slice(&buf1);
+
+        let socket_ttl = self.socket.ttl()?;
+        let adjust_ttl = packet.ttl > 0 && socket_ttl != packet.ttl;
+
+        if adjust_ttl {
+            self.socket.set_ttl(packet.ttl)?;
+        }
+        let res = match self.socket.poll_send_to(cx, &write_buf[..len], packet.dest) {
+            Poll::Pending => Ok(SendRes::NotSent),
+            Poll::Ready(Ok(n)) if n < len => {
+                // packet was only sent partially.
+                // can this actually happen?
+                // this means we should retry right away?
+                let _ = self.socket.poll_send_ready(cx);
+                Ok(SendRes::NotSent)
+            }
+            Poll::Ready(Ok(_n)) => Ok(SendRes::Sent),
+            Poll::Ready(Err(err)) => Err(err),
+        };
+        if adjust_ttl {
+            self.socket.set_ttl(socket_ttl)?;
+        }
+        res
+    }
+
+    // pub fn poll_check_timeouts(&mut self) -> io::Result<()> {
+    //     for stream in self.streams_by_id.values() {
+    //         stream.lock("stream:check_timeouts").check_timeouts()?;
     //     }
     //     Ok(())
     // }
 
-    async fn send_queue(&mut self) -> io::Result<()> {
-        while let Some(mut packet) = self.send_queue.get_mut(0) {
-            assert!(matches!(packet.status, PacketStatus::Sending));
-            // TODO: This should update the status within stream.outgoing, not here.
-            packet.status = PacketStatus::Inflight;
-            packet.transmits += 1;
-
-            self.write_buf[0..].copy_from_slice(&packet.bufs[0]);
-            self.write_buf[packet.bufs[0].len()..].copy_from_slice(&packet.bufs[1]);
-            let len = packet.bufs[0].len() + packet.bufs[1].len();
-
-            self.socket
-                .send_to(&self.write_buf[0..len], packet.dest)
-                .await?;
-
-            let _ = self.send_queue.pop_front();
+    pub fn poll(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        if self.status & UDX_SOCKET_CLOSING > 0 {
+            return Poll::Ready(Err(io::Error::new(io::ErrorKind::Other, "Closed by user")));
         }
-        Ok(())
+        // Read from the socket.
+        let mut read = 0;
+        loop {
+            let mut buf = ReadBuf::new(&mut self.read_buf);
+
+            let (len, _peer) = match self.socket.poll_recv_from(cx, &mut buf) {
+                Poll::Pending => break,
+                Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
+                Poll::Ready(Ok(peer)) => (buf.filled().len(), peer),
+            };
+            match self.process_incoming(len) {
+                Ok(ProcessRes::Handled) => {}
+                Ok(ProcessRes::NotHandled) => {
+                    // self.on_unhandled_packet(&self.read_buf[..n])?;
+                }
+                Err(_err) => {}
+            }
+            read += 1;
+        }
+        if read > 0 {
+            // eprintln!("[poll] read {}", read);
+        }
+
+        // Write packets out.
+        'send_packets: for stream in self.streams.values() {
+            let mut stream = stream.lock("stream:poll_send_queue");
+            match stream.check_timeouts() {
+                Ok(()) => {}
+                Err(err) => return Poll::Ready(Err(err)),
+            }
+            // TODO: This sorts packets always by streams, punishing later ids.
+            while let Some(mut packet_ref) = stream.send_queue.pop_front() {
+                let mut packet = match &mut packet_ref {
+                    PacketRef::Packet(packet) => Some(packet),
+                    PacketRef::Ref(seq) => stream.outgoing.get_mut(&seq),
+                };
+                let packet = packet.as_mut().unwrap();
+                assert!(matches!(packet.status, PacketStatus::Sending));
+                let res = self.try_poll_send_packet(cx, &packet);
+                match res? {
+                    SendRes::NotSent => {
+                        stream.send_queue.push_front(packet_ref);
+                        break 'send_packets;
+                    }
+                    SendRes::Sent => {
+                        packet.status = PacketStatus::Inflight;
+                        packet.transmits += 1;
+                        packet.time_sent = get_milliseconds();
+                    }
+                };
+            }
+            drop(stream);
+        }
+        // eprintln!(
+        //     "processed all streams. remaining: {}",
+        //     self.streams_by_id
+        //         .values()
+        //         .map(|s| s.lock("iter"))
+        //         .fold(0, |acc, stream| stream.send_queue.len() + acc)
+        // );
+
+        // register next wakeup.
+        while !matches!(self.timeout_interval.poll_tick(cx), Poll::Pending) {}
+
+        // always return pending - no need to call this again until either IO or the timeout is
+        // reached.
+        // TODO: Should be woken if new writes are queued in a stream?
+        Poll::Pending
     }
 
     fn process_incoming(&mut self, bytes: usize) -> io::Result<ProcessRes> {
         let header = match Header::from_bytes(&self.read_buf[..bytes]) {
-            // let header = match Header::from_bytes(&bytes) {
             Some(header) => header,
             None => return Ok(ProcessRes::NotHandled),
         };
-        let stream = match self.streams_by_id.get_mut(&header.local_id) {
+        // eprintln!("[{}] incoming {:?}", self.local_addr()?.port(), header);
+        let stream = match self.streams.get_mut(&header.local_id) {
             Some(stream) => stream,
             None => {
                 // self.invoke_preconnect();
@@ -217,165 +274,41 @@ impl UdxSocket {
                 return Ok(ProcessRes::NotHandled);
             }
         };
-        let mut stream = stream.lock("process_incoming");
-        if stream.status & UDX_STREAM_DEAD > 0 {
-            return Ok(ProcessRes::NotHandled);
-        }
-
-        if header.r#type & UDX_HEADER_SACK > 0 {
-            // process_sacks(stream, buf, buf_len)
-        }
-
         let mut offset = UDX_HEADER_SIZE;
         let mut len = bytes - UDX_HEADER_SIZE;
-
         // Done with header processing now.
         // For future compat, make sure we are now pointing at the actual data using the data_offset
         if header.data_offset > 0 {
             if header.data_offset > len {
                 return Ok(ProcessRes::NotHandled);
             }
-            offset = header.data_offset;
-            len += header.data_offset;
+            offset += header.data_offset;
+            len -= header.data_offset;
         }
-
-        // For all stream packets, ensure that they are causally newer (or same)
-        if seq_compare(stream.ack, header.seq) <= 0 {
-            if header.r#type & UDX_HEADER_DATA_OR_END > 0
-                && !stream.incoming.contains_key(&header.seq)
-                && stream.status & UDX_STREAM_SHOULD_READ == UDX_STREAM_READ
-            {
-                let buf = self.read_buf[offset..(offset + len)].to_vec();
-                stream.process_incoming_data_packet(&header, buf);
-            }
-
-            if header.r#type & UDX_HEADER_END > 0 {
-                stream.status |= UDX_STREAM_ENDING_REMOTE;
-                stream.remote_ended = header.seq;
-            }
-
-            if header.r#type & UDX_HEADER_DESTROY > 0 {
-                stream.status |= UDX_STREAM_DESTROYED_REMOTE;
-                // clear_outgoing_packets(stream)
-                // close_maybe(stream)
-                return Ok(ProcessRes::Handled);
-            }
-        }
-
-        if header.r#type & UDX_HEADER_MESSAGE > 0 {
-            let buf = self.read_buf[offset..(offset + len)].to_vec();
-            stream.on_recv(buf);
-        }
-
-        // process the read queue
-        while (stream.status & UDX_STREAM_SHOULD_READ) == UDX_STREAM_READ {
-            let ack = stream.ack;
-            let packet = stream.incoming.remove(&ack);
-            match packet {
-                None => break,
-                Some(packet) => {
-                    stream.pkts_buffered -= 1;
-                    stream.ack += 1;
-
-                    if packet.r#type & UDX_HEADER_DATA > 1 {
-                        stream.on_read(Some(packet.buf));
-                    }
-                }
-            }
-        }
-
-        // Check if the ack is oob.
-        if seq_compare(stream.seq, header.ack) < 0 {
-            return Ok(ProcessRes::Handled);
-        }
-
-        // Congestion control...
-        if stream.remote_acked != header.ack {
-            if stream.cwnd < stream.ssthresh {
-                stream.cwnd += UDX_MTU;
-            } else {
-                stream.cwnd += ((UDX_MTU * UDX_MTU) / stream.cwnd).max(1);
-            }
-        } else if header.r#type & UDX_HEADER_DATA_OR_END == 0 {
-            stream.dup_acks += 1;
-            if stream.dup_acks >= 3 {
-                stream.fast_retransmit();
-            }
-        }
-
-        let len = seq_diff(header.ack, stream.remote_acked);
-        for _i in 0..len {
-            let seq = stream.remote_acked;
-            stream.remote_acked += 1;
-            match stream.ack_packet(seq, false) {
-                AckRes::Acked => continue,
-                AckRes::Ended => {
-                    // it ended, so ack that and trigger close
-                    // TODO: make this work as well, if the ack packet is lost, ie
-                    // have some internal (capped) queue of "gracefully closed" streams
-                    stream.send_state_packet();
-                    stream.close_maybe(None);
-                    return Ok(ProcessRes::Handled);
-                }
-                AckRes::NotFound => {
-                    return Ok(ProcessRes::Handled);
-                }
-            }
-        }
-        // if data pkt, send an ack - use deferred acks as well...
-        if header.r#type & UDX_HEADER_DATA_OR_END > 0 {
-            stream.send_state_packet();
-        }
-
-        if stream.status & UDX_STREAM_SHOULD_END_REMOTE == UDX_STREAM_END_REMOTE
-            && seq_compare(stream.remote_ended, stream.ack) <= 0
-        {
-            stream.on_read(None);
-            if stream.close_maybe(None) {
-                return Ok(ProcessRes::Handled);
-            }
-        }
-
-        if stream.pkts_waiting > 0 {
-            stream.check_timeouts()?;
-        }
-
-        Ok(ProcessRes::Handled)
+        let buf = &self.read_buf[offset..(offset + len)];
+        let mut stream = stream.lock("stream:sock.process_incoming");
+        stream.process_incoming(&header, &buf)
     }
 
-    /* async fn on_incoming(&mut self, header: Header) -> bool { */
-    /*     let data = &self.read_buf[UDX_HEADER_SIZE..]; */
-    /*     let stream = self.streams_by_id.get(&header.local_id); */
-    /*     if stream.is_none() { */
-    /*         return false; */
-    /*     } */
-    /*     let stream = stream.unwrap(); */
-    /*     true */
-    /* } */
-
-    fn on_unhandled_packet(&self, buf: &[u8]) -> io::Result<()> {
+    fn on_unhandled_packet(&self, _buf: &[u8]) -> io::Result<()> {
         // TODO: What to do with non-stream packets?
         Ok(())
     }
 
-    pub fn queue_send(&mut self, packet: Packet) {
-        self.send_queue.push_back(packet)
-    }
-
-    pub fn send(&self, req: SendRequest) {}
-    pub fn send_ttl(&mut self, mut req: SendRequest, buf: UdxBuf, dest: SocketAddr, ttl: u32) {
-        {
-            let pkt = &mut req.pkt;
-            pkt.status = PacketStatus::Sending;
-            pkt.r#type = UDX_PACKET_SEND;
-            pkt.ttl = ttl;
-            pkt.dest = dest;
-            pkt.transmits = 0;
-            pkt.bufs_len = 1;
-            pkt.bufs[0] = buf;
-        }
-        self.send_queue.push_back(req.pkt);
-    }
+    // pub fn send(&self, _req: SendRequest) {}
+    // pub fn send_ttl(&mut self, mut req: SendRequest, buf: UdxBuf, dest: SocketAddr, ttl: u32) {
+    //     {
+    //         let pkt = &mut req.pkt;
+    //         pkt.status = PacketStatus::Sending;
+    //         pkt.r#type = UDX_PACKET_SEND;
+    //         pkt.ttl = ttl;
+    //         pkt.dest = dest;
+    //         pkt.transmits = 0;
+    //         pkt.bufs_len = 1;
+    //         pkt.bufs[0] = buf;
+    //     }
+    //     self.send_queue.push_back(req.pkt);
+    // }
 }
 
 pub struct SendRequest {
@@ -383,11 +316,11 @@ pub struct SendRequest {
     data: u32, // request id
 }
 
-fn seq_diff(a: u32, b: u32) -> i32 {
+pub fn seq_diff(a: u32, b: u32) -> i32 {
     (a as i32) - (b as i32)
 }
 
-fn seq_compare(a: u32, b: u32) -> i8 {
+pub fn seq_compare(a: u32, b: u32) -> i8 {
     let d = seq_diff(a, b);
     if d < 0 {
         -1
