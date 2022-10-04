@@ -1,23 +1,29 @@
-pub const UDX_DEFAULT_TTL: u32 = 64;
+#![allow(dead_code)]
 
+use std::time::Duration;
+
+// header typs (bitflags)
+pub const UDX_HEADER_DATA: u32 = 1;
+pub const UDX_HEADER_END: u32 = 2;
+pub const UDX_HEADER_SACK: u32 = 4;
+pub const UDX_HEADER_MESSAGE: u32 = 8;
+pub const UDX_HEADER_DESTROY: u32 = 16;
+
+/// Max transmit attempts per packet
 pub const UDX_MAX_TRANSMITS: u8 = 5;
+pub const UDX_CLOCK_GRANULARITY_MS: Duration = Duration::from_millis(20);
 
-pub const UDX_MTU: u32 = 1400;
 pub const UDX_HEADER_SIZE: usize = 20;
 pub const UDX_MAX_DATA_SIZE: usize = 1380;
-pub const UDX_CLOCK_GRANULARITY_MS: u32 = 20;
 pub const UDX_MAGIC_BYTE: u8 = 255;
 pub const UDX_VERSION: u8 = 1;
 
+pub const UDX_DEFAULT_TTL: u32 = 64;
+pub const UDX_MTU: usize = 1400;
 pub const UDX_SOCKET_RECEIVING: u32 = 1;
 pub const UDX_SOCKET_BOUND: u32 = 2;
 pub const UDX_SOCKET_CLOSING: u32 = 4;
 pub const UDX_SOCKET_CLOSING_HANDLES: u32 = 8;
-
-// replaced by PacketStatus
-// pub const UDX_PACKET_WAITING: u32 = 1;
-// pub const UDX_PACKET_SENDING: u32 = 2;
-// pub const UDX_PACKET_INFLIGHT: u32 = 3;
 
 pub const UDX_PACKET_STREAM_STATE: u32 = 1;
 pub const UDX_PACKET_STREAM_WRITE: u32 = 2;
@@ -28,12 +34,6 @@ pub const UDX_PACKET_SEND: u32 = 16;
 pub const UDX_PACKET_CALLBACK: u32 =
     UDX_PACKET_STREAM_SEND | UDX_PACKET_STREAM_DESTROY | UDX_PACKET_SEND;
 pub const UDX_PACKET_FREE_ON_SEND: u32 = UDX_PACKET_STREAM_STATE | UDX_PACKET_STREAM_DESTROY;
-
-pub const UDX_HEADER_DATA: u32 = 1;
-pub const UDX_HEADER_END: u32 = 2;
-pub const UDX_HEADER_SACK: u32 = 4;
-pub const UDX_HEADER_MESSAGE: u32 = 8;
-pub const UDX_HEADER_DESTROY: u32 = 16;
 
 pub const UDX_HEADER_DATA_OR_END: u32 = UDX_HEADER_DATA | UDX_HEADER_END;
 
