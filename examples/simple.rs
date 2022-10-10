@@ -34,6 +34,7 @@ async fn main() -> io::Result<()> {
 
     let message = vec![3u8; 3000];
     let limit = 1024 * 1024 * 64;
+    // let limit = 3000;
     let start = Instant::now();
     // let ra = spawn("read a", read_loop(streama.clone(), "a", max_len));
     let wa = spawn(
@@ -95,12 +96,12 @@ async fn main() -> io::Result<()> {
 async fn read_loop(mut stream: UdxStream, name: &str, max_len: usize) -> io::Result<()> {
     let mut buf = vec![0u8; max_len];
     stream.read_exact(&mut buf).await?;
-    // let mut buf = vec![0u8; 2048];
+
     // let mut len = 0;
     // loop {
     //     let n = stream.read(&mut buf).await?;
     //     len += n;
-    //     // eprintln!("[{} read ] {}", name, to_string(&buf[..n]));
+    //     eprintln!("[{} read ] {}", name, to_string(&buf[..n]));
     //     if len >= max_len {
     //         break;
     //     }

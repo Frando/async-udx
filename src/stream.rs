@@ -1,3 +1,4 @@
+use bytes::BufMut;
 use futures::{Future, FutureExt};
 use std::collections::HashMap;
 use std::collections::{BTreeMap, VecDeque};
@@ -23,8 +24,10 @@ use crate::error::UdxError;
 use crate::mutex::{Mutex, MutexGuard};
 use crate::packet::{Header, IncomingPacket, Packet, PacketRef};
 use crate::socket::EventIncoming;
+use crate::udp::{Transmit, UdpState};
 
 const SSTHRESH: usize = 0xffff;
+const MAX_SEGMENTS: usize = 10;
 
 #[derive(Debug, Default, Clone)]
 pub struct StreamStats {
@@ -87,7 +90,8 @@ impl Future for StreamDriver {
 impl UdxStream {
     pub(crate) fn connect(
         recv_rx: Receiver<EventIncoming>,
-        send_tx: Sender<PacketRef>,
+        send_tx: Sender<Transmit>,
+        udp_state: Arc<UdpState>,
         dest: SocketAddr,
         // _local_id: u32,
         remote_id: u32,
@@ -119,6 +123,7 @@ impl UdxStream {
             on_close: None,
             stats: Default::default(),
             state: StreamState::Open,
+            udp_state,
         };
         let stream = UdxStream(Arc::new(Mutex::new(stream)));
         let driver = StreamDriver(stream.clone());
@@ -181,7 +186,7 @@ impl AsyncWrite for UdxStream {
 
 #[derive(Debug)]
 pub(crate) struct UdxStreamInner {
-    send_tx: Sender<PacketRef>,
+    send_tx: Sender<Transmit>,
     recv_rx: Receiver<EventIncoming>,
 
     incoming: BTreeMap<u32, IncomingPacket>,
@@ -213,6 +218,8 @@ pub(crate) struct UdxStreamInner {
 
     stats: StreamStats,
     state: StreamState,
+
+    udp_state: Arc<UdpState>,
 }
 
 impl UdxStreamInner {
@@ -314,8 +321,36 @@ impl UdxStreamInner {
     }
 
     fn poll_transmit(&mut self, _cx: &mut Context<'_>) {
+        let max_segments = self.udp_state.max_gso_segments().min(MAX_SEGMENTS);
+        // eprintln!("poll_transmit send_queue {:#?}", self.send_queue);
+        // let mut num_datagrams = 0;
+        let mut transmits = VecDeque::new();
+        let mut queue = VecDeque::new();
+        let mut segment_size = 0;
         while let Some(packet) = self.send_queue.pop_front() {
-            match self.send_tx.send(packet) {
+            if packet.buf.len() != segment_size {
+                queue_transmits(
+                    &mut transmits,
+                    &mut queue,
+                    segment_size,
+                    max_segments,
+                    self.remote_addr,
+                );
+            }
+            segment_size = packet.buf.len();
+            queue.push_back(packet);
+        }
+        queue_transmits(
+            &mut transmits,
+            &mut queue,
+            segment_size,
+            max_segments,
+            self.remote_addr,
+        );
+        // eprintln!("poll_transmit transmits {:#?}", transmits);
+
+        while let Some(transmit) = transmits.pop_front() {
+            match self.send_tx.send(transmit) {
                 Ok(()) => {}
                 Err(_packet) => unimplemented!(),
             }
@@ -570,5 +605,31 @@ impl Debug for UdxStream {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let inner = self.0.lock("UdxStream::debug");
         write!(f, "{:#?}", &*inner)
+    }
+}
+
+fn queue_transmits(
+    transmits: &mut VecDeque<Transmit>,
+    queue: &mut VecDeque<PacketRef>,
+    segment_size: usize,
+    max_transmits: usize,
+    remote_addr: SocketAddr,
+) {
+    while !queue.is_empty() {
+        let segments = queue.len().min(max_transmits);
+        let size = segments * segment_size;
+        let mut buf = Vec::with_capacity(size);
+        for _ in 0..segments {
+            let packet = queue.pop_front().unwrap();
+            buf.put_slice(packet.buf.as_slice());
+        }
+        let transmit = Transmit {
+            destination: remote_addr,
+            ecn: None,
+            src_ip: None,
+            segment_size: Some(UDX_MTU),
+            contents: buf,
+        };
+        transmits.push_back(transmit);
     }
 }

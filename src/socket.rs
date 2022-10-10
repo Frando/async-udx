@@ -1,22 +1,25 @@
+use bytes::BytesMut;
 use futures::Future;
 use std::collections::HashMap;
+use std::collections::VecDeque;
 use std::fmt::Debug;
 use std::io;
+use std::io::IoSliceMut;
+use std::mem::MaybeUninit;
 use std::net::SocketAddr;
+use std::net::ToSocketAddrs;
 use std::pin::Pin;
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::task::{Context, Poll};
-use tokio::io::ReadBuf;
-use tokio::net::ToSocketAddrs;
-use tokio::net::UdpSocket;
 use tokio::sync::mpsc::{self, UnboundedReceiver as Receiver, UnboundedSender as Sender};
 use tracing::{debug, trace};
 
 use crate::constants::UDX_HEADER_SIZE;
+use crate::constants::UDX_MTU;
 use crate::mutex::Mutex;
-use crate::packet::{Header, IncomingPacket, Packet, PacketRef};
+use crate::packet::{Header, IncomingPacket};
 use crate::stream::UdxStream;
+use crate::udp::{RecvMeta, Transmit, UdpSocket, UdpState, BATCH_SIZE};
 
 const MAX_LOOP: usize = 60;
 
@@ -86,24 +89,28 @@ impl Future for SocketDriver {
 
 pub struct UdxSocketInner {
     socket: UdpSocket,
-    send_rx: Receiver<PacketRef>,
-    send_tx: Sender<PacketRef>,
+    send_rx: Receiver<Transmit>,
+    send_tx: Sender<Transmit>,
     streams: HashMap<u32, StreamHandle>,
-    pending_send: Option<PacketRef>,
-    read_buf: Vec<u8>,
+    pending_transmits: VecDeque<Transmit>,
+    recv_buf: Box<[u8]>,
+    udp_state: Arc<UdpState>,
 }
 
 impl UdxSocketInner {
     pub async fn bind<A: ToSocketAddrs>(addr: A) -> io::Result<Self> {
-        let socket = UdpSocket::bind(addr).await?;
+        let socket = std::net::UdpSocket::bind(addr)?;
+        let socket = UdpSocket::from_std(socket)?;
         let (send_tx, send_rx) = mpsc::unbounded_channel();
+        let recv_buf = vec![0; UDX_MTU * BATCH_SIZE];
         Ok(Self {
             socket,
             send_rx,
             send_tx,
             streams: HashMap::new(),
-            read_buf: vec![0u8; 2048],
-            pending_send: None,
+            recv_buf: recv_buf.into(),
+            udp_state: Arc::new(UdpState::new()),
+            pending_transmits: VecDeque::new(),
         })
     }
 
@@ -125,101 +132,119 @@ impl UdxSocketInner {
             remote_id
         );
         let (recv_tx, recv_rx) = mpsc::unbounded_channel();
-        let stream = UdxStream::connect(recv_rx, self.send_tx.clone(), dest, remote_id);
+        let stream = UdxStream::connect(
+            recv_rx,
+            self.send_tx.clone(),
+            self.udp_state.clone(),
+            dest,
+            remote_id,
+        );
         let handle = StreamHandle { recv_tx };
         self.streams.insert(local_id, handle);
         Ok(stream)
     }
 
-    fn poll_send_packet(&mut self, cx: &mut Context<'_>, packet: &Packet) -> io::Result<bool> {
-        trace!(
-            to = packet.header.stream_id,
-            "send typ {} seq {} ack {} tx {}",
-            packet.header.typ,
-            packet.header.seq,
-            packet.header.ack,
-            packet.transmits.load(Ordering::SeqCst)
-        );
-        match self
-            .socket
-            .poll_send_to(cx, &packet.buf.as_slice(), packet.dest)
-        {
-            Poll::Pending => Ok(false),
-            Poll::Ready(Err(err)) => Err(err),
-            Poll::Ready(Ok(n)) => {
-                if n == packet.buf.len() {
-                    Ok(true)
-                } else {
-                    Ok(false)
-                }
-            }
-        }
-    }
-
     fn poll_transmit(&mut self, cx: &mut Context<'_>) -> io::Result<bool> {
-        // process transmits
         let mut iters = 0;
-        while iters < MAX_LOOP {
+        loop {
             iters += 1;
-            if let Some(packet) = self.pending_send.take() {
-                if self.poll_send_packet(cx, &packet)? {
-                    // packet.transmits.fetch_add(1, Ordering::SeqCst);
-                } else {
-                    self.pending_send = Some(packet);
-                    break;
-                }
-            } else {
+            while self.pending_transmits.len() < BATCH_SIZE {
                 match Pin::new(&mut self.send_rx).poll_recv(cx) {
                     Poll::Pending => break,
                     Poll::Ready(None) => unreachable!(),
-                    Poll::Ready(Some(packet)) => {
-                        self.pending_send = Some(packet);
+                    Poll::Ready(Some(transmit)) => {
+                        self.pending_transmits.push_back(transmit);
                     }
                 }
             }
+            if self.pending_transmits.is_empty() {
+                break Ok(false);
+            }
+
+            match self
+                .socket
+                .poll_send(&self.udp_state, cx, self.pending_transmits.as_slices().0)
+            {
+                Poll::Pending => break Ok(false),
+                Poll::Ready(Err(err)) => break Err(err),
+                Poll::Ready(Ok(n)) => {
+                    self.pending_transmits.drain(..n);
+                }
+            }
+            if iters > 10 {
+                break Ok(true);
+            }
         }
-        Ok(iters == MAX_LOOP)
     }
 
-    fn poll_recv(&mut self, cx: &mut Context<'_>) -> io::Result<bool> {
+    fn poll_recv<'a>(&'a mut self, cx: &mut Context<'_>) -> io::Result<bool> {
+        // Taken from: quinn/src/endpoint.rs
+        let mut metas = [RecvMeta::default(); BATCH_SIZE];
+        let mut iovs = MaybeUninit::<[IoSliceMut<'a>; BATCH_SIZE]>::uninit();
+        self.recv_buf
+            .chunks_mut(self.recv_buf.len() / BATCH_SIZE)
+            .enumerate()
+            .for_each(|(i, buf)| unsafe {
+                iovs.as_mut_ptr()
+                    .cast::<IoSliceMut>()
+                    .add(i)
+                    .write(IoSliceMut::<'a>::new(buf));
+            });
+        let mut iovs = unsafe { iovs.assume_init() };
+
         // process recv
         let mut iters = 0;
         while iters < MAX_LOOP {
             iters += 1;
-            let (len, header, _peer) = {
-                // todo: vectorize
-                let mut buf = ReadBuf::new(&mut self.read_buf);
-                let peer = match self.socket.poll_recv_from(cx, &mut buf)? {
-                    Poll::Pending => break,
-                    Poll::Ready(peer) => peer,
-                };
-                let header = Header::from_bytes(buf.filled())?;
-                (buf.filled().len(), header, peer)
-            };
-            trace!(
-                to = header.stream_id,
-                "recv typ {} seq {} ack {} len {}",
-                header.typ,
-                header.seq,
-                header.ack,
-                len
-            );
-            match self.streams.get_mut(&header.stream_id) {
-                Some(handle) => {
-                    let incoming = IncomingPacket {
-                        header,
-                        buf: self.read_buf[UDX_HEADER_SIZE..len].to_vec().into(),
-                        read_offset: 0,
-                    };
-                    let event = EventIncoming::Packet(incoming);
-                    match handle.recv_tx.send(event) {
-                        Ok(()) => {}
-                        Err(_packet) => unimplemented!(),
+            match self.socket.poll_recv(cx, &mut iovs, &mut metas) {
+                Poll::Pending => break,
+                Poll::Ready(Err(e)) => return Err(e),
+                Poll::Ready(Ok(msgs)) => {
+                    for (meta, buf) in metas.iter().zip(iovs.iter()).take(msgs) {
+                        let mut data: BytesMut = buf[0..meta.len].into();
+                        let len = data.len();
+                        match Header::from_bytes(&data) {
+                            Err(_err) => {
+                                // received invalid header.
+                                // treat as received message.
+                                // push to recv_message queue.
+                            }
+                            Ok(header) => {
+                                trace!(
+                                    to = header.stream_id,
+                                    "recv typ {} seq {} ack {} len {}",
+                                    header.typ,
+                                    header.seq,
+                                    header.ack,
+                                    len
+                                );
+                                let stream_id = header.stream_id;
+                                match self.streams.get(&stream_id) {
+                                    None => {
+                                        // received packet for nonexisting stream.
+                                        // emit event to allow to open channel
+                                    }
+                                    Some(handle) => {
+                                        let _ = data.split_to(UDX_HEADER_SIZE);
+                                        let incoming = IncomingPacket {
+                                            header,
+                                            buf: data.into(),
+                                            read_offset: 0,
+                                        };
+                                        let event = EventIncoming::Packet(incoming);
+                                        match handle.recv_tx.send(event) {
+                                            Ok(()) => {}
+                                            Err(_packet) => {
+                                                // stream was dropped.
+                                                // remove stream?
+                                                self.streams.remove(&stream_id);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
                     }
-                }
-                None => {
-                    // received packet for nonexisting stream.
-                    // emit event to allow to open channel
                 }
             }
         }
