@@ -1,9 +1,22 @@
 use async_udx::{UdxError, UdxSocket, UdxStream};
-use std::io;
+use std::{io, time::Duration};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 #[tokio::test]
 async fn stream_read_write() -> io::Result<()> {
+    eprintln!("ok go");
+    run().await?;
+    // drop(streama);
+    // drop(streamb);
+    // drop(socka);
+    // drop(sockb);
+    eprintln!("wait");
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    eprintln!("done");
+    Ok(())
+}
+
+async fn run() -> io::Result<()> {
     let ((socka, sockb), (mut streama, mut streamb)) = create_pair().await?;
     assert_eq!(socka.local_addr().unwrap(), streamb.remote_addr());
 
@@ -12,6 +25,7 @@ async fn stream_read_write() -> io::Result<()> {
     let mut read = vec![0u8; 3];
     streamb.read_exact(&mut read).await?;
     assert_eq!(msg, read);
+    eprintln!("now drop");
     Ok(())
 }
 
@@ -23,15 +37,15 @@ async fn stream_close() -> io::Result<()> {
     // write a message.
     let msg = vec![1, 2, 3];
     streama.write_all(&msg).await?;
-    assert_eq!(streama.stats().pkts_inflight, 1);
+    assert_eq!(streama.stats().inflight_packets, 1);
 
     // close the stream
     let close = streama.close();
-    assert_eq!(streama.stats().pkts_inflight, 1);
+    assert_eq!(streama.stats().inflight_packets, 1);
 
     // wait until closing is complete == all packages flushed
     close.await;
-    assert_eq!(streama.stats().pkts_inflight, 0);
+    assert_eq!(streama.stats().inflight_packets, 0);
 
     // ensure reading on other end still works
     let mut read = vec![0u8; 3];

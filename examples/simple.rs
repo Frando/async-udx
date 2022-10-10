@@ -29,12 +29,12 @@ async fn main() -> io::Result<()> {
     let mut sockb = UdxSocket::bind("127.0.0.1:20005").await?;
     let addrb = sockb.local_addr()?;
     eprintln!("sockb {addrb}");
-    let streama = socka.connect(addrb, 1, 2)?;
-    let streamb = sockb.connect(addra, 2, 1)?;
+    let streama = socka.connect(addrb, 1, 1)?;
+    let streamb = sockb.connect(addra, 1, 1)?;
 
     let message = vec![3u8; 3000];
     let limit = 1024 * 1024 * 64;
-    // let limit = 3000;
+    // let limit = 6000;
     let start = Instant::now();
     // let ra = spawn("read a", read_loop(streama.clone(), "a", max_len));
     let wa = spawn(
@@ -57,6 +57,10 @@ async fn main() -> io::Result<()> {
     let throughput = limit as f32 / start.elapsed().as_secs_f32() / (1024. * 1024.);
     eprintln!("finish");
     eprintln!("throughput: {} MB/s", throughput);
+    eprintln!("stats streamA {:?}", streama.stats());
+    eprintln!("stats streamB {:?}", streamb.stats());
+    eprintln!("stats sockA {:?}", socka.stats());
+    eprintln!("stats sockB {:?}", sockb.stats());
     // tokio::time::sleep(Duration::from_secs(1)).await;
     // eprintln!("finish a {:?}", streama);
     // eprintln!("finish b {:?}", streamb);

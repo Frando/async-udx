@@ -2,7 +2,7 @@
 
 use std::{io, time::Instant};
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt, BufReader},
+    io::{AsyncReadExt, AsyncWriteExt},
     net::TcpStream,
 };
 
@@ -11,7 +11,6 @@ criterion_group!(server_benches, bench_throughput);
 criterion_main!(server_benches);
 fn rt() -> tokio::runtime::Runtime {
     tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(4)
         .enable_all()
         .build()
         .unwrap()
@@ -27,58 +26,116 @@ fn bench_throughput(c: &mut Criterion) {
     // let len: usize = 1024 * 3;
     // let lens = [1024 * 4, 1024 * 64, 1024 * 512, 1024 * 1024];
     // let lens = [1024 * 512, 1024 * 1024];
-    let lens = [1024 * 4, 1024 * 512];
+    let lens = [1024 * 512, 1024 * 4];
+    let n_streams = [1, 4, 16, 64, 512];
     // let lens = [1024 * 64];
     // let lens = [1024 * 512];
-    for len in lens {
-        group.throughput(Throughput::Bytes(len as u64));
-        // group.bench_with_input(BenchmarkId::new("tcp", len as u64), &len, |b, len| {
-        //     let limit = *len;
-        //     b.to_async(&rt).iter_custom(|iters| async move {
-        //         // let mut dur = Duration::new(0, 0);
-        //         let (mut sa, mut sb) = setup_pipe_tcp().await.unwrap();
-        //         let (mut _ra, mut wa) = sa.into_split();
-        //         let (mut rb, mut _wb) = sb.into_split();
-        //         let mut read_buf = vec![0u8; limit];
-        //         let mut rb = BufReader::new(rb);
-        //         let start = Instant::now();
-        //         for i in 0..iters {
-        //             let twa = tokio::spawn(async move {
-        //                 let message = vec![1u8; limit];
-        //                 wa.write_all(&message).await.unwrap();
-        //                 wa
-        //             });
-        //             rb.read_exact(&mut read_buf).await.unwrap();
-        //             wa = twa.await.unwrap();
-        //         }
-        //         start.elapsed()
-        //     })
-        // });
-        group.bench_with_input(BenchmarkId::new("udx", len as u64), &len, |b, len| {
-            let limit = *len;
-            b.to_async(&rt).iter_custom(|iters| async move {
-                let (mut wa, wb) = setup_pipe_udx().await.unwrap();
-                // let mut wa = ra.clone();
-                // let wb = rb.clone();
-                let mut read_buf = vec![0u8; limit];
-                let mut rb = BufReader::new(wb);
-                let start = Instant::now();
-                let _message = vec![1u8; limit];
-                for _i in 0..iters {
-                    // eprintln!("####### ITER {}", i);
-                    let twa = tokio::spawn(async move {
-                        let message = vec![1u8; limit];
-                        wa.write_all(&message).await.unwrap();
-                        // eprintln!("write all! {}", message.len());
-                        wa
-                    });
-                    rb.read_exact(&mut read_buf).await.unwrap();
-                    // eprintln!("read all!");
-                    wa = twa.await.unwrap();
-                }
-                start.elapsed()
-            })
-        });
+    for n_streams in n_streams {
+        for len in lens {
+            group.throughput(Throughput::Bytes(len as u64));
+            group.bench_with_input(
+                BenchmarkId::new(format!("udx_{}", n_streams), len as u64),
+                &len,
+                |b, len| {
+                    // let num_streams = 10usize;
+                    let num_streams = n_streams;
+                    let limit = *len / num_streams;
+                    b.to_async(&rt).iter_custom(|iters| async move {
+                        let socka = UdxSocket::bind("127.0.0.1:0").await.unwrap();
+                        let sockb = UdxSocket::bind("127.0.0.1:0").await.unwrap();
+                        let addra = socka.local_addr().unwrap();
+                        let addrb = sockb.local_addr().unwrap();
+                        let mut readers = vec![];
+                        let mut writers = vec![];
+                        for i in 1..=num_streams as u32 {
+                            let streama = socka.connect(addrb, i, i).unwrap();
+                            let streamb = sockb.connect(addra, i, i).unwrap();
+                            let read_buf = vec![0u8; limit];
+                            let write_buf = vec![1u8; limit];
+                            if i % 2 == 0 {
+                                readers.push((streama, read_buf));
+                                writers.push((streamb, write_buf));
+                            } else {
+                                readers.push((streamb, write_buf));
+                                writers.push((streama, read_buf));
+                            }
+                        }
+
+                        let start = Instant::now();
+                        for _i in 0..iters {
+                            let writers_task = tokio::spawn(async move {
+                                let mut tasks = vec![];
+                                while let Some(writer) = writers.pop() {
+                                    let task = tokio::spawn(async move {
+                                        let (mut writer, message) = writer;
+                                        writer.write_all(&message).await.unwrap();
+                                        (writer, message)
+                                    });
+                                    tasks.push(task);
+                                }
+                                let mut writers = vec![];
+                                while let Some(task) = tasks.pop() {
+                                    let writer = task.await.unwrap();
+                                    writers.push(writer);
+                                }
+                                writers
+                            });
+
+                            let mut tasks = vec![];
+                            while let Some(reader) = readers.pop() {
+                                let task = tokio::spawn(async move {
+                                    let (mut reader, mut read_buf) = reader;
+                                    reader.read_exact(&mut read_buf).await.unwrap();
+                                    (reader, read_buf)
+                                });
+                                tasks.push(task);
+                            }
+                            while let Some(task) = tasks.pop() {
+                                let reader = task.await.unwrap();
+                                readers.push(reader);
+                            }
+                            writers = writers_task.await.unwrap();
+                        }
+                        let res = start.elapsed();
+                        drop(socka);
+                        drop(sockb);
+                        res
+                    })
+                },
+            );
+        }
+        // group.bench_with_input(
+        //     BenchmarkId::new("udx_single_stream", len as u64),
+        //     &len,
+        //     |b, len| {
+        //         let limit = *len;
+        //         b.to_async(&rt).iter_custom(|iters| async move {
+        //             let (mut wa, mut rb) = setup_pipe_udx().await.unwrap();
+        //             // let mut wa = ra.clone();
+        //             // let wb = rb.clone();
+        //             let mut read_buf = vec![0u8; limit];
+        //             // let mut rb = BufReader::new(wb);
+        //             let start = Instant::now();
+        //             let _message = vec![1u8; limit];
+        //             for _i in 0..iters {
+        //                 // eprintln!("####### ITER {}", i);
+        //                 let twa = tokio::spawn(async move {
+        //                     let message = vec![1u8; limit];
+        //                     wa.write_all(&message).await.unwrap();
+        //                     // eprintln!("write all! {}", message.len());
+        //                     wa
+        //                 });
+        //                 rb.read_exact(&mut read_buf).await.unwrap();
+        //                 // eprintln!("read all!");
+        //                 wa = twa.await.unwrap();
+        //             }
+        //             let res = start.elapsed();
+        //             // eprintln!("stats a {:?}", wa.stats());
+        //             // eprintln!("stats b {:?}", wb.stats());
+        //             res
+        //         })
+        //     },
+        // );
     }
     //     group.bench_with_input(BenchmarkId::new("udx", len as u64), &len, |b, len| {
     //         let limit = *len;
@@ -134,8 +191,8 @@ async fn setup_pipe_tcp() -> io::Result<(TcpStream, TcpStream)> {
 }
 
 async fn setup_pipe_udx() -> io::Result<(UdxStream, UdxStream)> {
-    let mut socka = UdxSocket::bind("127.0.0.1:0").await?;
-    let mut sockb = UdxSocket::bind("127.0.0.1:0").await?;
+    let socka = UdxSocket::bind("127.0.0.1:0").await?;
+    let sockb = UdxSocket::bind("127.0.0.1:0").await?;
     let addra = socka.local_addr()?;
     let addrb = sockb.local_addr()?;
     let streama = socka.connect(addrb, 1, 2)?;
@@ -343,3 +400,25 @@ async fn setup_pipe_udx() -> io::Result<(UdxStream, UdxStream)> {
 
 //     Ok(())
 // }
+// group.bench_with_input(BenchmarkId::new("tcp", len as u64), &len, |b, len| {
+//     let limit = *len;
+//     b.to_async(&rt).iter_custom(|iters| async move {
+//         // let mut dur = Duration::new(0, 0);
+//         let (mut sa, mut sb) = setup_pipe_tcp().await.unwrap();
+//         let (mut _ra, mut wa) = sa.into_split();
+//         let (mut rb, mut _wb) = sb.into_split();
+//         let mut read_buf = vec![0u8; limit];
+//         let mut rb = BufReader::new(rb);
+//         let start = Instant::now();
+//         for i in 0..iters {
+//             let twa = tokio::spawn(async move {
+//                 let message = vec![1u8; limit];
+//                 wa.write_all(&message).await.unwrap();
+//                 wa
+//             });
+//             rb.read_exact(&mut read_buf).await.unwrap();
+//             wa = twa.await.unwrap();
+//         }
+//         start.elapsed()
+//     })
+// });
