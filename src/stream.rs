@@ -13,11 +13,11 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::mpsc::{UnboundedReceiver as Receiver, UnboundedSender as Sender};
 use tokio::sync::oneshot;
 use tokio::time::Sleep;
-use tracing::{debug, trace};
+use tracing::{debug, trace, warn};
 
 use crate::constants::{
-    UDX_CLOCK_GRANULARITY_MS, UDX_HEADER_DATA, UDX_HEADER_END, UDX_HEADER_SACK, UDX_MAX_DATA_SIZE,
-    UDX_MAX_TRANSMITS, UDX_MTU,
+    UDX_CLOCK_GRANULARITY_MS, UDX_HEADER_DATA, UDX_HEADER_END, UDX_HEADER_MESSAGE, UDX_HEADER_SACK,
+    UDX_MAX_DATA_SIZE, UDX_MAX_TRANSMITS, UDX_MSS, UDX_MTU,
 };
 use crate::error::UdxError;
 use crate::mutex::{Mutex, MutexGuard};
@@ -106,6 +106,7 @@ impl UdxStream {
             local_id,
             seq: 0,
             ack: 0,
+            seq_flushed: 0,
             inflight: 0,
             cwnd: 2 * UDX_MTU,
             remote_acked: 0,
@@ -127,6 +128,8 @@ impl UdxStream {
             stats: Default::default(),
             state: StreamState::Open,
             udp_state,
+            on_firewall: None,
+            out_of_order: 0,
         };
         let stream = UdxStream(Arc::new(Mutex::new(stream)));
         let driver = StreamDriver(stream.clone());
@@ -140,8 +143,8 @@ impl UdxStream {
         let (tx, rx) = oneshot::channel();
         stream.on_close = Some(tx);
         drop(stream);
-        let rx = rx.map(|_r| ());
-        rx
+
+        rx.map(|_r| ())
     }
 
     pub fn remote_addr(&self) -> SocketAddr {
@@ -187,7 +190,6 @@ impl AsyncWrite for UdxStream {
     }
 }
 
-#[derive(Debug)]
 pub(crate) struct UdxStreamInner {
     send_tx: Sender<EventOutgoing>,
     recv_rx: Receiver<EventIncoming>,
@@ -200,15 +202,18 @@ pub(crate) struct UdxStreamInner {
     local_id: u32,
     remote_addr: SocketAddr,
 
-    seq: u32,
-    ack: u32,
-    remote_acked: u32,
-    inflight: usize,
+    seq: u32,          // highest seq we created and tried to send
+    seq_flushed: u32,  // highest seq we flushed to the socket send queue
+    ack: u32,          // highest ack we sent out
+    remote_acked: u32, // highest ack we received from the remote
+    inflight: usize,   // amount of bytes that are sent but not acked
     cwnd: usize,
     rto: Duration,
     rto_timeout: Pin<Box<Sleep>>,
     rttvar: Duration,
     srtt: Duration,
+
+    out_of_order: usize,
 
     read_cursor: u32,
 
@@ -219,11 +224,28 @@ pub(crate) struct UdxStreamInner {
     error: Option<UdxError>,
 
     on_close: Option<oneshot::Sender<()>>,
+    on_firewall: Option<Box<dyn (Fn(SocketAddr) -> bool) + Send>>,
 
     stats: StreamStats,
     state: StreamState,
 
     udp_state: Arc<UdpState>,
+}
+
+impl Debug for UdxStreamInner {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("UdxStreamInner")
+            .field("remote_id", &self.remote_id)
+            .field("local_id", &self.local_id)
+            .field("seq", &self.seq)
+            .field("seq_flushed", &self.seq_flushed)
+            .field("ack", &self.ack)
+            .field("remote_acked", &self.remote_acked)
+            .field("inflight", &self.inflight)
+            .field("cwnd", &self.cwnd)
+            .field("rto", &self.rto)
+            .finish()
+    }
 }
 
 // enum CloseReason {
@@ -245,7 +267,7 @@ impl Drop for UdxStream {
 impl UdxStreamInner {
     fn create_header(&self, mut typ: u32) -> Header {
         if matches!(self.state, StreamState::LocalClosed) {
-            typ = typ & UDX_HEADER_END;
+            typ &= UDX_HEADER_END;
         }
         Header {
             stream_id: self.remote_id,
@@ -416,8 +438,13 @@ impl UdxStreamInner {
         }
         if !queue.is_empty() {
             let set = PacketSet::new(self.remote_addr, queue, segment_size);
+            let len = set.len();
             if let Err(_err) = self.send_tx.send(EventOutgoing::Transmit(set)) {
-                unimplemented!();
+                warn!(
+                    "failed to send {} packets: send channel to socket closed",
+                    len
+                )
+                // unimplemented!();
             }
         }
     }
@@ -484,7 +511,7 @@ impl UdxStreamInner {
                 self.handle_remote_ack_for_packet(&packet);
             } else {
                 // Received invalid ack (too high)
-                tracing::error!("received invalid ack (too high)");
+                tracing::warn!("received invalid ack (too high)");
             }
         }
 
@@ -494,6 +521,7 @@ impl UdxStreamInner {
             }
         }
 
+        // reset rto, since things are moving forward.
         self.rto_timeout
             .as_mut()
             .reset(tokio::time::Instant::now().checked_add(self.rto).unwrap());
@@ -553,6 +581,7 @@ impl UdxStreamInner {
         }
     }
 
+    // fn process_packet
     fn handle_incoming(&mut self, packet: IncomingPacket) {
         trace!(
             lid = self.local_id,
@@ -565,13 +594,30 @@ impl UdxStreamInner {
             packet.header.seq,
             packet.header.ack
         );
+
+        // check firewall.
+        let pass = self
+            .on_firewall
+            .as_ref()
+            .map(|on_firewall| on_firewall(packet.from))
+            .unwrap_or(true);
+        if !pass {
+            return;
+        }
+
         self.stats.rx_packets += 1;
+
+        // TODO: Support relay
+        // if (stream->relay_to) return relay_packet(stream, buf, buf_len, type, seq, ack);
 
         if packet.has_type(UDX_HEADER_SACK) {
             self.handle_incoming_sacks(&packet);
         }
 
+        // done with header processing.
+
         let header = packet.header.clone();
+
         if packet.has_type(UDX_HEADER_END) {
             self.state = StreamState::RemoteClosed;
             self.terminate(UdxError::closed_by_remote());
@@ -581,25 +627,42 @@ impl UdxStreamInner {
         if packet.has_type(UDX_HEADER_DATA) {
             self.stats.rx_bytes += packet.data_len();
             let seq = packet.seq();
+            // ignore packets older than what we acked already
             if seq >= self.ack {
                 self.incoming.insert(seq, packet);
             }
+
+            self.out_of_order += 1;
+
+            // increase ack for in-order packets
+            while self.incoming.contains_key(&self.ack) {
+                self.ack += 1;
+                self.out_of_order -= 1;
+            }
+
+            // packet is next in line, wake the read waker.
             if seq == self.ack {
                 if let Some(waker) = self.read_waker.take() {
                     waker.wake();
                 }
             }
-            while self.incoming.contains_key(&self.ack) {
-                self.ack += 1;
-            }
             self.send_state_packet();
         }
 
-        // congestion control..
+        // TODO: message packets
+        // if packet.has_type(UDX_HEADER_MESSAGE) {
+        //     self.handle_recv_message(packet)
+        // }
+
+        // check if received ack is out of bounds
         if header.ack > self.seq {
             return;
         }
-        if header.ack != self.remote_acked {
+
+        let is_limited = self.inflight + 2 * UDX_MSS < self.cwnd * UDX_MSS;
+
+        // congestion control..
+        if header.ack > self.remote_acked {
             if self.cwnd < SSTHRESH {
                 self.cwnd += UDX_MTU;
             } else {
@@ -607,6 +670,8 @@ impl UdxStreamInner {
             }
         }
     }
+
+    fn ack_update(&mut self, acked: usize, is_limited: bool) {}
 
     fn read_next(&mut self, buf: &mut tokio::io::ReadBuf<'_>) -> io::Result<bool> {
         let mut did_read = false;
@@ -635,7 +700,7 @@ impl UdxStreamInner {
     fn send_state_packet(&mut self) {
         let mut typ = 0;
         if let Some(_error) = &self.error {
-            typ = typ | UDX_HEADER_END;
+            typ |= UDX_HEADER_END;
         }
         let packet = self.create_packet(typ, &[]);
         self.send_queue.push_back(PacketRef::Owned(packet));
@@ -719,11 +784,11 @@ impl AsyncRead for UdxStreamInner {
         //     self.ack,
         //     self.incoming.len()
         // );
-        if let Some(error) = &self.error {
-            return Poll::Ready(Err(error.clone().into()));
-        }
         let did_read = self.read_next(buf)?;
         let res = if !did_read {
+            if let Some(error) = &self.error {
+                return Poll::Ready(Err(error.clone().into()));
+            }
             self.read_waker = Some(cx.waker().clone());
             Poll::Pending
         } else {

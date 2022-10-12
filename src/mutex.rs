@@ -25,7 +25,7 @@ mod tracking {
     /// A Mutex which optionally allows to track the time a lock was held and
     /// emit warnings in case of excessive lock times
     pub struct Mutex<T> {
-        inner: std::sync::Mutex<Inner<T>>,
+        inner: parking_lot::Mutex<Inner<T>>,
     }
 
     impl<T: Debug> std::fmt::Debug for Mutex<T> {
@@ -37,7 +37,7 @@ mod tracking {
     impl<T> Mutex<T> {
         pub fn new(value: T) -> Self {
             Self {
-                inner: std::sync::Mutex::new(Inner {
+                inner: parking_lot::Mutex::new(Inner {
                     last_lock_owner: VecDeque::new(),
                     value,
                 }),
@@ -49,7 +49,7 @@ mod tracking {
         /// The purpose will be recorded in the list of last lock owners
         pub fn lock(&self, purpose: &'static str) -> MutexGuard<T> {
             let now = Instant::now();
-            let guard = self.inner.lock().unwrap();
+            let guard = self.inner.lock();
 
             let lock_time = Instant::now();
             let elapsed = lock_time.duration_since(now);
@@ -70,7 +70,7 @@ mod tracking {
     }
 
     pub struct MutexGuard<'a, T> {
-        guard: std::sync::MutexGuard<'a, Inner<T>>,
+        guard: parking_lot::MutexGuard<'a, Inner<T>>,
         start_time: Instant,
         purpose: &'static str,
     }
@@ -133,13 +133,13 @@ mod non_tracking {
     /// emit warnings in case of excessive lock times
     #[derive(Debug)]
     pub struct Mutex<T> {
-        inner: std::sync::Mutex<T>,
+        inner: parking_lot::Mutex<T>,
     }
 
     impl<T> Mutex<T> {
         pub fn new(value: T) -> Self {
             Self {
-                inner: std::sync::Mutex::new(value),
+                inner: parking_lot::Mutex::new(value),
             }
         }
 
@@ -148,13 +148,13 @@ mod non_tracking {
         /// The purpose will be recorded in the list of last lock owners
         pub fn lock(&self, _purpose: &'static str) -> MutexGuard<T> {
             MutexGuard {
-                guard: self.inner.lock().unwrap(),
+                guard: self.inner.lock(),
             }
         }
     }
 
     pub struct MutexGuard<'a, T> {
-        guard: std::sync::MutexGuard<'a, T>,
+        guard: parking_lot::MutexGuard<'a, T>,
     }
 
     impl<'a, T> Deref for MutexGuard<'a, T> {

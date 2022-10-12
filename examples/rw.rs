@@ -34,15 +34,15 @@ async fn main() -> io::Result<()> {
         .next()
         .expect("invalid connect addr");
     eprintln!("{} -> {}", listen_addr, connect_addr);
-    let mut sock = UdxSocket::bind(listen_addr).await?;
+    let sock = UdxSocket::bind(listen_addr).await?;
     let stream = sock.connect(connect_addr, 1, 1)?;
     let max_len = UDX_DATA_MTU * 64;
     let read = spawn("read", read_loop(stream.clone()));
     let msg = vec![1u8; UDX_DATA_MTU * 8];
     let write = spawn("write", write_loop(stream.clone(), msg, max_len));
-    write.await;
+    write.await?;
     eprintln!("write finished");
-    read.await;
+    read.await?;
     eprintln!("read finished");
     eprintln!("finish {:?}", stream);
     Ok(())
@@ -70,10 +70,10 @@ async fn write_loop(mut stream: UdxStream, msg: Vec<u8>, limit: usize) -> io::Re
             break;
         }
     }
-    eprintln!("write finish after {}", written);
+    eprintln!("write finish after {} ({} iterations)", written, i);
     // stream.close().await?;
     Ok(())
 }
-fn to_string(buf: &[u8]) -> String {
-    String::from_utf8(buf.to_vec()).unwrap_or_else(|_| format!("<invalid bytes {:?}>", buf))
-}
+// fn to_string(buf: &[u8]) -> String {
+//     String::from_utf8(buf.to_vec()).unwrap_or_else(|_| format!("<invalid bytes {:?}>", buf))
+// }

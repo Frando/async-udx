@@ -9,12 +9,33 @@ use udx_udp::Transmit;
 use crate::constants::{UDX_HEADER_SIZE, UDX_MAGIC_BYTE, UDX_VERSION};
 
 #[derive(Debug)]
+pub struct Dgram {
+    pub buf: Vec<u8>,
+    pub dest: SocketAddr,
+}
+
+impl Dgram {
+    pub fn new(dest: SocketAddr, buf: Vec<u8>) -> Self {
+        Self { dest, buf }
+    }
+    pub fn into_transmit(self) -> Transmit {
+        Transmit {
+            segment_size: None,
+            destination: self.dest,
+            ecn: None,
+            src_ip: None,
+            contents: self.buf,
+        }
+    }
+}
+
+#[derive(Debug)]
 pub(crate) enum PacketRef {
     Owned(Packet),
     Shared(Arc<Packet>),
 }
 
-// invariant: all packets need to have the same size if segment_size is set!!
+// invariant: all packets need to have the same size if segment_size is set
 // invariant: may not be larger than max_segments as reported from usp_state
 pub struct PacketSet {
     dest: SocketAddr,
@@ -57,6 +78,17 @@ impl PacketSet {
         }
     }
 
+    pub fn len(&self) -> usize {
+        self.packets.len()
+    }
+
+    pub fn iter_shared(&self) -> impl IntoIterator<Item = &Packet> {
+        self.packets.iter().filter_map(|packet| match packet {
+            PacketRef::Shared(packet) => Some(packet.as_ref()),
+            _ => None,
+        })
+    }
+
     // pub fn new_single(packet: PacketRef) -> Self {
     //     Self {
     //         dest: packet.dest,
@@ -85,7 +117,8 @@ impl PacketSet {
                 //     let packet = self.packets.get(j).unwrap();
                 //     buf.put_slice(packet.buf.as_slice());
                 // }
-                let transmit = Transmit {
+
+                Transmit {
                     destination: self.dest,
                     ecn: None,
                     src_ip: None,
@@ -94,8 +127,7 @@ impl PacketSet {
                         1 => None,
                         _ => Some(segment_size),
                     },
-                };
-                transmit
+                }
                 // self
                 // .packets
                 // .iter()
@@ -119,8 +151,8 @@ impl std::ops::Deref for PacketRef {
     type Target = Packet;
     fn deref(&self) -> &Self::Target {
         match self {
-            PacketRef::Owned(packet) => &packet,
-            PacketRef::Shared(packet) => &packet,
+            PacketRef::Owned(packet) => packet,
+            PacketRef::Shared(packet) => packet,
         }
     }
 }
@@ -154,7 +186,7 @@ impl PacketBuf {
     }
 }
 
-pub(crate) struct Packet {
+pub struct Packet {
     pub waiting: AtomicBool,
     pub skip: AtomicBool,
     pub time_sent: AtomicInstant,
@@ -220,7 +252,7 @@ impl Packet {
     }
 
     pub fn data_len(&self) -> usize {
-        self.buf.len().checked_sub(UDX_HEADER_SIZE).unwrap_or(0)
+        self.buf.len().saturating_sub(UDX_HEADER_SIZE)
     }
 
     fn to_transmit(&self) -> Transmit {
@@ -238,6 +270,7 @@ pub(crate) struct IncomingPacket {
     pub header: Header,
     pub buf: Bytes,
     pub read_offset: usize,
+    pub from: SocketAddr,
 }
 
 impl fmt::Debug for IncomingPacket {
