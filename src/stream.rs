@@ -16,8 +16,8 @@ use tokio::time::Sleep;
 use tracing::{debug, trace, warn};
 
 use crate::constants::{
-    UDX_CLOCK_GRANULARITY_MS, UDX_HEADER_DATA, UDX_HEADER_END, UDX_HEADER_MESSAGE, UDX_HEADER_SACK,
-    UDX_MAX_DATA_SIZE, UDX_MAX_TRANSMITS, UDX_MSS, UDX_MTU,
+    UDX_CLOCK_GRANULARITY_MS, UDX_HEADER_DATA, UDX_HEADER_END, UDX_HEADER_SACK, UDX_MAX_DATA_SIZE,
+    UDX_MAX_TRANSMITS, UDX_MTU,
 };
 use crate::error::UdxError;
 use crate::mutex::{Mutex, MutexGuard};
@@ -45,10 +45,41 @@ enum StreamState {
     Open,
     LocalClosed,
     RemoteClosed,
+    BothClosed,
 }
 
-#[derive(Clone)]
-pub struct UdxStream(Arc<Mutex<UdxStreamInner>>);
+impl StreamState {
+    fn close_local(&mut self) {
+        *self = match self {
+            StreamState::RemoteClosed | StreamState::BothClosed => StreamState::BothClosed,
+            _ => StreamState::LocalClosed,
+        }
+    }
+    fn close_remote(&mut self) {
+        *self = match self {
+            StreamState::LocalClosed | StreamState::BothClosed => StreamState::BothClosed,
+            _ => StreamState::RemoteClosed,
+        }
+    }
+
+    fn local_closed(&self) -> bool {
+        match self {
+            StreamState::LocalClosed | StreamState::BothClosed => true,
+            _ => false,
+        }
+    }
+
+    fn remote_closed(&self) -> bool {
+        match self {
+            StreamState::RemoteClosed | StreamState::BothClosed => true,
+            _ => false,
+        }
+    }
+
+    fn closed(&self) -> bool {
+        self.local_closed() || self.remote_closed()
+    }
+}
 
 pub struct StreamDriver(UdxStream);
 
@@ -90,6 +121,9 @@ impl Future for StreamDriver {
     }
 }
 
+#[derive(Clone)]
+pub struct UdxStream(Arc<Mutex<UdxStreamInner>>);
+
 impl UdxStream {
     pub(crate) fn connect(
         recv_rx: Receiver<EventIncoming>,
@@ -129,7 +163,7 @@ impl UdxStream {
             state: StreamState::Open,
             udp_state,
             on_firewall: None,
-            out_of_order: 0,
+            // out_of_order: 0,
         };
         let stream = UdxStream(Arc::new(Mutex::new(stream)));
         let driver = StreamDriver(stream.clone());
@@ -145,6 +179,11 @@ impl UdxStream {
         drop(stream);
 
         rx.map(|_r| ())
+    }
+
+    pub fn closed(&self) -> bool {
+        let stream = self.lock("UdxStream::close");
+        stream.state.closed()
     }
 
     pub fn remote_addr(&self) -> SocketAddr {
@@ -213,8 +252,7 @@ pub(crate) struct UdxStreamInner {
     rttvar: Duration,
     srtt: Duration,
 
-    out_of_order: usize,
-
+    // out_of_order: usize,
     read_cursor: u32,
 
     read_waker: Option<Waker>,
@@ -266,7 +304,7 @@ impl Drop for UdxStream {
 
 impl UdxStreamInner {
     fn create_header(&self, mut typ: u32) -> Header {
-        if matches!(self.state, StreamState::LocalClosed) {
+        if self.state.local_closed() {
             typ &= UDX_HEADER_END;
         }
         Header {
@@ -289,7 +327,7 @@ impl UdxStreamInner {
 
     fn terminate(&mut self, error: impl Into<UdxError>) {
         self.error = Some(error.into());
-        self.state = StreamState::LocalClosed;
+        self.state.close_local();
         self.send_state_packet();
 
         if let Some(waker) = self.read_waker.take() {
@@ -619,7 +657,7 @@ impl UdxStreamInner {
         let header = packet.header.clone();
 
         if packet.has_type(UDX_HEADER_END) {
-            self.state = StreamState::RemoteClosed;
+            self.state.close_remote();
             self.terminate(UdxError::closed_by_remote());
         }
 
@@ -632,13 +670,15 @@ impl UdxStreamInner {
                 self.incoming.insert(seq, packet);
             }
 
-            self.out_of_order += 1;
+            // self.out_of_order += 1;
 
             // increase ack for in-order packets
-            while self.incoming.contains_key(&self.ack) {
-                self.ack += 1;
-                self.out_of_order -= 1;
+            let mut max_in_order_seq = self.ack;
+            while self.incoming.contains_key(&max_in_order_seq) {
+                max_in_order_seq += 1;
+                // self.out_of_order -= 1;
             }
+            self.ack = (max_in_order_seq - 1).max(self.ack);
 
             // packet is next in line, wake the read waker.
             if seq == self.ack {
@@ -659,7 +699,7 @@ impl UdxStreamInner {
             return;
         }
 
-        let is_limited = self.inflight + 2 * UDX_MSS < self.cwnd * UDX_MSS;
+        // let is_limited = self.inflight + 2 * UDX_MSS < self.cwnd * UDX_MSS;
 
         // congestion control..
         if header.ack > self.remote_acked {
@@ -671,7 +711,7 @@ impl UdxStreamInner {
         }
     }
 
-    fn ack_update(&mut self, acked: usize, is_limited: bool) {}
+    // fn ack_update(&mut self, acked: usize, is_limited: bool) {}
 
     fn read_next(&mut self, buf: &mut tokio::io::ReadBuf<'_>) -> io::Result<bool> {
         let mut did_read = false;

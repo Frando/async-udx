@@ -37,7 +37,7 @@ async fn main() -> io::Result<()> {
     let sock = UdxSocket::bind(listen_addr).await?;
     let stream = sock.connect(connect_addr, 1, 1)?;
     let max_len = UDX_DATA_MTU * 64;
-    let read = spawn("read", read_loop(stream.clone()));
+    let read = spawn("read", read_loop(stream.clone(), max_len));
     let msg = vec![1u8; UDX_DATA_MTU * 8];
     let write = spawn("write", write_loop(stream.clone(), msg, max_len));
     write.await?;
@@ -48,13 +48,17 @@ async fn main() -> io::Result<()> {
     Ok(())
 }
 
-async fn read_loop(mut stream: UdxStream) -> io::Result<()> {
+async fn read_loop(mut stream: UdxStream, limit: usize) -> io::Result<()> {
     let mut buf = vec![0u8; UDX_DATA_MTU * 8];
     let mut len = 0;
     loop {
         let n = stream.read(&mut buf).await?;
         len += n;
-        eprintln!("read {} total {}", n, len);
+        eprintln!("recv {} total {}", n, len);
+        if len > limit {
+            eprintln!("read finished after {}", limit);
+            break Ok(());
+        }
     }
 }
 
@@ -63,14 +67,14 @@ async fn write_loop(mut stream: UdxStream, msg: Vec<u8>, limit: usize) -> io::Re
     let mut written = 0;
     loop {
         stream.write_all(&msg).await?;
-        eprintln!("wrote {} total {}", msg.len(), written);
         written += msg.len();
         i += 1;
+        eprintln!("sent {} total {}", msg.len(), written);
         if written > limit {
             break;
         }
     }
-    eprintln!("write finish after {} ({} iterations)", written, i);
+    eprintln!("write finished after {} ({} iterations)", written, i);
     // stream.close().await?;
     Ok(())
 }
