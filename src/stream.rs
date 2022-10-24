@@ -673,15 +673,13 @@ impl UdxStreamInner {
             // self.out_of_order += 1;
 
             // increase ack for in-order packets
-            let mut max_in_order_seq = self.ack;
-            while self.incoming.contains_key(&max_in_order_seq) {
-                max_in_order_seq += 1;
+            while self.incoming.contains_key(&self.ack) {
+                self.ack += 1;
                 // self.out_of_order -= 1;
             }
-            self.ack = (max_in_order_seq - 1).max(self.ack);
 
             // packet is next in line, wake the read waker.
-            if seq == self.ack {
+            if seq <= self.ack {
                 if let Some(waker) = self.read_waker.take() {
                     waker.wake();
                 }
