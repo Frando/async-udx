@@ -93,7 +93,7 @@ async fn main() {
         let reader = task.await.unwrap();
         readers.push(reader);
     }
-    writers = writers_task.await.unwrap();
+    writers_task.await.unwrap();
     let dur = start.elapsed();
     eprintln!("socka stats {:#?}", socka.stats());
     eprintln!("sockb stats {:#?}", sockb.stats());

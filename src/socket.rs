@@ -467,6 +467,5 @@ unsafe fn iovectors_from_buf<'a, const N: usize>(buf: &'a mut [u8]) -> [IoSliceM
                 .add(i)
                 .write(IoSliceMut::<'a>::new(buf));
         });
-    let iovs = { iovs.assume_init() };
-    iovs
+    iovs.assume_init()
 }

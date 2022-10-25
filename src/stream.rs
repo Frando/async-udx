@@ -63,17 +63,11 @@ impl StreamState {
     }
 
     fn local_closed(&self) -> bool {
-        match self {
-            StreamState::LocalClosed | StreamState::BothClosed => true,
-            _ => false,
-        }
+        matches!(self, StreamState::LocalClosed | StreamState::BothClosed)
     }
 
     fn remote_closed(&self) -> bool {
-        match self {
-            StreamState::RemoteClosed | StreamState::BothClosed => true,
-            _ => false,
-        }
+        matches!(self, StreamState::RemoteClosed | StreamState::BothClosed)
     }
 
     fn closed(&self) -> bool {

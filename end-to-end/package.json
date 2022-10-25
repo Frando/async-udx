@@ -1,0 +1,16 @@
+{
+  "name": "end-to-end",
+  "version": "1.0.0",
+  "main": "index.js",
+  "license": "MIT",
+  "type": "module",
+  "dependencies": {
+    "chalk": "^5.1.2",
+    "sillyname": "^0.1.0",
+    "split2": "^4.1.0",
+    "udx-native": "^1.5.0"
+  },
+  "devDependencies": {
+    "why-is-node-running": "^2.2.2"
+  }
+}

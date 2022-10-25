@@ -15,3 +15,9 @@ See [this example]('./examples/bench.rs') for an example.
 ## End-to-end example
 
 The repo includes an [end to end example script](end-to-end/README.md) that runs the protocol between Rust and Node.js implementations.
+
+## Development
+
+Contributions are welcome!
+
+The repo includes a [Wireshark](https://www.wireshark.org/) dissector that may help debugging protocol issues. See the [docs](docs/wireshark/README.md).
