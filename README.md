@@ -6,7 +6,6 @@ udx is reliable, multiplex, and congestion controlled streams over udp. This cra
 
 This is an alpha release. The wire protocol works and is compatible to the Node.js version.
 It misses testing, some congestion control features and does not implement the network interface detection features of libudx.
-Perfomance is not yet ideal, but it should be en par or faster to the Node.js implementation (minus some congestion control optimizations).
 
 ## Usage
 
