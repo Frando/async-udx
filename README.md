@@ -9,7 +9,7 @@ It misses testing, some congestion control features and does not implement the n
 
 ## Usage
 
-See [this example]('examples/simple.rs') for an example.
+See [this example](examples/simple.rs) for an example.
 
 ## End-to-end example
 
