@@ -20,3 +20,9 @@ The repo includes an [end to end example script](end-to-end/README.md) that runs
 Contributions are welcome!
 
 The repo includes a [Wireshark](https://www.wireshark.org/) dissector that may help debugging protocol issues. See the [docs](docs/wireshark/README.md).
+
+## Thanks
+
+This implementation was possible in part due to support from the [NLNet foundation](https://nlnet.nl)
+
+![NLNet logo](https://nlnet.nl/logo/banner-160x60.jpg)
